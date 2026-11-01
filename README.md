@@ -44,44 +44,23 @@ A fully automated Telegram shop for digital keys. It runs on any ordinary **cPan
 
 ---
 
-## Installation (about 10 minutes)
+## Installation (about 3 minutes, one form)
 
-### 1. Create the bot
-1. Open [@BotFather](https://t.me/BotFather) → `/newbot` → copy the **token**.
-2. Get your own Telegram numeric ID from [@userinfobot](https://t.me/userinfobot). This makes you the admin.
+1. **Make your bot:** in Telegram open [@BotFather](https://t.me/BotFather), send `/newbot`, pick a name and copy the **token**. Then open your new bot and press **START**.
+2. **Upload:** download this repo as a ZIP (**Code → Download ZIP**). In cPanel open **File Manager → public_html**, create a folder `bot`, upload the ZIP into it and click **Extract**. If the files land in a sub-folder, move them up into `bot`.
+3. **Install:** open `https://yourdomain.com/bot/install.php` and fill in the form:
+   - your bot token
+   - your wallet addresses (at least one)
+   - your cPanel login, so the installer can create the database for you (not saved)
 
-### 2. Create the database
-cPanel → **MySQL® Databases**:
-1. Create a database, e.g. `cpuser_shop`
-2. Create a user with a strong password
-3. Add the user to the database with **ALL PRIVILEGES**
+   Click **🚀 Install**. You get a "Your shop is live" message in Telegram.
+4. Send **/admin** to your bot → **Catalog** → add a category, a product and your keys. Done ✅
 
-### 3. Upload the files
-1. cPanel → **File Manager** → `public_html` → create a folder, e.g. `bot`
-2. Upload this project's files into `public_html/bot/` (upload a zip and use *Extract*).
-3. Rename (copy) `config.sample.php` → `config.php` and edit it:
-   - `bot_token`, `bot_username`, `admin_ids`
-   - `webhook_secret`: a random string of letters/numbers, 20+ characters
-   - `base_url`: e.g. `https://yourdomain.com/bot`
-   - `db`: the database name, user and password from step 2
-   - your **USDT TRC20 / USDT BEP20 / BTC addresses** in the `crypto` section
+The installer finds your Telegram ID automatically, writes the config, links the bot to Telegram and locks itself afterwards. To start over, delete `config.php` and open `install.php` again.
 
-### 4. Run setup
-Open this in your browser:
+**Optional:** add the cron job shown on the success page (cPanel → Cron Jobs → Once Per Minute). Without it, deposits are still checked automatically whenever anyone uses the bot. With it, they're also checked when the bot is quiet.
 
-```
-https://yourdomain.com/bot/setup.php?key=YOUR_WEBHOOK_SECRET
-```
-
-It creates the tables, connects the bot to Telegram, checks your wallet addresses and prints the cron command. You should see all ✅.
-
-### 5. Add the cron job
-See [Setting up the cron job](#setting-up-the-cron-job-important) below.
-
-### 6. Add products
-Open your bot → `/admin` → **Catalog** → **Add Category** → **Add Product** → paste or upload the keys.
-
-That's it. Customers send `/start`.
+**Everything is free.** You need no API keys and no payment gateway. Blockchain data comes from free public services.
 
 ---
 
@@ -103,7 +82,7 @@ Deposits expire after 60 minutes (configurable). A payment that arrives late is 
 | BTC | mempool.space API | Or `https://blockstream.info/api`; confirmations default 1 |
 | BTC price | Coinbase → Kraken → CoinGecko → Binance | Automatic fallback |
 
-### Setting up the cron job (important)
+### Cron job (optional)
 cPanel → **Cron Jobs** → *Once Per Minute* (`* * * * *`) → command:
 
 ```
@@ -113,7 +92,7 @@ php /home/YOURUSER/public_html/bot/cron.php >/dev/null 2>&1
 `setup.php` prints the exact path for your account. If your host has no command-line PHP, use:
 `wget -q -O /dev/null "https://yourdomain.com/bot/cron.php?key=YOUR_WEBHOOK_SECRET"`
 
-The cron job only calls the blockchain APIs while there are open deposits, so it is very light. Without cron, deposits are still credited when users tap **Check Payment**, but not automatically.
+The cron job only calls the blockchain APIs while there are open deposits, so it is very light. Without cron, deposits are checked whenever someone uses the bot (at most once a minute) and when users tap **Check Payment**.
 
 ### Wallet tips
 - Use addresses from a wallet **you control** (Trust Wallet, TronLink, MetaMask for BSC, Electrum/BlueWallet for BTC).
@@ -127,8 +106,9 @@ The cron job only calls the blockchain APIs while there are open deposits, so it
 ```
 bot/
 ├── webhook.php          ← Telegram sends updates here
-├── setup.php            ← one-time installer (safe to re-run)
-├── config.php           ← your settings (create from config.sample.php)
+├── install.php          ← setup wizard (open it once in your browser)
+├── setup.php            ← re-links the bot if you change domain (setup.php?key=SECRET)
+├── config.php           ← your settings (created by the installer)
 ├── install.sql          ← database schema (setup.php runs it for you)
 ├── cron.php           ← checks the blockchain for deposits (run every minute)
 ├── src/                 ← bot logic (blocked from web access)
@@ -146,11 +126,12 @@ bot/
 
 | Problem | Fix |
 |---|---|
-| Bot doesn't reply | Re-open `setup.php?key=…` and read any ⚠️ line. Check that `base_url` is HTTPS and correct. Check `storage/error.log`. |
+| Installer: "could not reach cPanel automatically" | Your host blocks it. Choose **I already made one**, create a database in cPanel → MySQL Databases, and type its details. |
+| Bot doesn't reply | Open `setup.php?key=YOUR_SECRET` (the secret is `webhook_secret` in `config.php`) and read any ⚠️ line. Check `storage/error.log`. |
 | "SSL certificate problem" in the webhook error | Enable AutoSSL in cPanel → SSL/TLS Status. |
 | Deposits don't credit | Check that the cron job runs (run `php cron.php` in cPanel Terminal, it prints what it scanned). Check `storage/error.log` for API errors. For TRON rate limits add a TronGrid API key. For BSC timeouts try another `rpc` or lower `log_chunk`. The user can always use **Submit TXID**. |
 | Broadcast stops early on a large user list | Some hosts kill long scripts. Ask the host to raise `max_execution_time`, or broadcast in smaller batches. |
-| 500 error | Usually a typo in `config.php`, or PHP < 8.0. Select PHP 8.x in cPanel → **MultiPHP Manager**. |
+| 500 error | Usually PHP < 8.0. Select PHP 8.x in cPanel → **MultiPHP Manager**. |
 
 **Admin tips:**
 - Users can type `/cancel` to stop any text input.

@@ -744,6 +744,27 @@ function run_deposit_checks(): array
     return $report;
 }
 
+/**
+ * Run deposit checks at most once a minute, triggered by normal bot traffic.
+ * Makes a cron job optional. The Telegram request is answered first so the bot stays fast.
+ */
+function maybe_run_background_checks(): void
+{
+    $now = time();
+    q("INSERT IGNORE INTO settings (k, v) VALUES ('cron_last_run', '0')");
+    // Atomic claim: only one request per minute wins.
+    $st = q("UPDATE settings SET v=? WHERE k='cron_last_run' AND CAST(v AS UNSIGNED) <= ?", [$now, $now - 60]);
+    if ($st->rowCount() !== 1) {
+        return;
+    }
+    $open = (int)q("SELECT COUNT(*) FROM deposits WHERE (status IN ('pending','expired') AND created_at > NOW() - INTERVAL 1 DAY)")->fetchColumn();
+    if ($open === 0) {
+        return;
+    }
+    finish_request();
+    run_deposit_checks();
+}
+
 function txid_status_text(string $status): string
 {
     return [

@@ -1,7 +1,7 @@
 Options -Indexes
 
 # Block direct access to sensitive files
-<FilesMatch "^(config\.php|config\.sample\.php|install\.sql|README\.md|\.gitignore)$">
+<FilesMatch "^(config\.php|install\.sql|README\.md|\.gitignore)$">
     <IfModule mod_authz_core.c>
         Require all denied
     </IfModule>

@@ -22,3 +22,10 @@ try {
 } catch (Throwable $e) {
     log_error('Update error: ' . $e->getMessage() . ' @ ' . $e->getFile() . ':' . $e->getLine());
 }
+
+// No cron job? Bot traffic checks deposits in the background (at most once a minute).
+try {
+    maybe_run_background_checks();
+} catch (Throwable $e) {
+    log_error('Background checks: ' . $e->getMessage());
+}
