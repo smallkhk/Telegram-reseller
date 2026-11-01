@@ -58,18 +58,35 @@ CREATE TABLE IF NOT EXISTS orders (
 CREATE TABLE IF NOT EXISTS deposits (
     id INT AUTO_INCREMENT PRIMARY KEY,
     user_id BIGINT NOT NULL,
-    gateway VARCHAR(20) NOT NULL,
+    chain VARCHAR(10) NOT NULL,
     amount DECIMAL(14,2) NOT NULL,
-    pay_amount DECIMAL(16,2) NULL,
-    pay_currency VARCHAR(10) NULL,
-    status ENUM('pending','paid','failed','expired') NOT NULL DEFAULT 'pending',
-    reference VARCHAR(64) NOT NULL,
-    gateway_ref VARCHAR(128) NULL,
-    pay_url TEXT NULL,
+    pay_amount DECIMAL(24,8) NOT NULL,
+    rate DECIMAL(18,2) NULL,
+    credited DECIMAL(14,2) NULL,
+    status ENUM('pending','paid','expired','cancelled') NOT NULL DEFAULT 'pending',
+    txid VARCHAR(100) NULL,
+    claim_txid VARCHAR(100) NULL,
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at DATETIME NOT NULL,
     paid_at DATETIME NULL,
-    UNIQUE KEY uniq_ref (reference),
+    INDEX idx_match (chain, status, created_at),
     INDEX idx_user (user_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS chain_txs (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    chain VARCHAR(10) NOT NULL,
+    txid VARCHAR(100) NOT NULL,
+    idx INT NOT NULL DEFAULT 0,
+    amount VARCHAR(80) NOT NULL,
+    deposit_id INT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uniq_tx (chain, txid, idx)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS settings (
+    k VARCHAR(64) NOT NULL PRIMARY KEY,
+    v TEXT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS transactions (

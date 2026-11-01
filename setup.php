@@ -76,10 +76,25 @@ if (!empty($info['result']['last_error_message'])) {
     out('⚠️ Last webhook error reported by Telegram: ' . $info['result']['last_error_message']);
 }
 
+// 4) Wallets
+$patterns = [
+    'trc20' => '/^T[1-9A-HJ-NP-Za-km-z]{33}$/',
+    'bep20' => '/^0x[0-9a-fA-F]{40}$/',
+    'btc'   => '/^(bc1[02-9ac-hj-np-z]{11,71}|[13][1-9A-HJ-NP-Za-km-z]{25,34})$/i',
+];
+$chains = chains_enabled();
+if (!$chains) {
+    out('⚠️ No crypto wallet enabled — set at least one address in config.php (crypto section)');
+}
+foreach ($chains as $c => $info) {
+    $addr = trim((string)cfg("crypto.$c.address"));
+    out((preg_match($patterns[$c], $addr) ? '✅ ' : '❌ INVALID ADDRESS? ') . $info['label'] . ': ' . $addr);
+}
+
 out('');
-out('Payment callback URLs (paste these in your gateway dashboards):');
-out('  NOWPayments IPN : ' . $base . '/ipn/nowpayments.php');
-out('  Paystack webhook: ' . $base . '/ipn/paystack.php');
+out('⏰ Add this cron job in cPanel > Cron Jobs (Once Per Minute):');
+out('   php ' . __DIR__ . '/cron.php >/dev/null 2>&1');
+out('   (or) wget -q -O /dev/null "' . $base . '/cron.php?key=' . $secret . '"');
 out('');
 out('🎉 Done! Open your bot in Telegram and send /start. Admins send /admin.');
 out('🔒 Tip: you can delete setup.php from the server now (re-upload it if you need it again).');

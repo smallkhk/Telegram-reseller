@@ -250,10 +250,11 @@ function admin_callback(array $user, int $chatId, ?int $msgId, array $p): void
 function admin_deposits_view(): array
 {
     $rows = q('SELECT * FROM deposits ORDER BY id DESC LIMIT 20')->fetchAll();
-    $icons = ['pending' => '⏳', 'paid' => '✅', 'failed' => '❌', 'expired' => '⌛'];
+    $icons = ['pending' => '⏳', 'paid' => '✅', 'cancelled' => '❌', 'expired' => '⌛'];
     $text = "💳 <b>Recent deposits</b>\n\n";
     foreach ($rows as $d) {
-        $text .= ($icons[$d['status']] ?? '•') . " #{$d['id']} • <b>" . money($d['amount']) . '</b> • ' . gateway_label($d['gateway'])
+        $text .= ($icons[$d['status']] ?? '•') . " #{$d['id']} • <b>" . money($d['status'] === 'paid' ? $d['credited'] : $d['amount']) . '</b> • '
+            . norm_dec((string)$d['pay_amount']) . ' ' . chain_short($d['chain'])
             . " • <code>{$d['user_id']}</code>\n   <i>" . e(substr($d['created_at'], 0, 16)) . "</i>\n";
     }
     if (!$rows) {

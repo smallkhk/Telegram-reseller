@@ -18,7 +18,7 @@ return [
 
     // ---- Shop -----------------------------------------------------------
     'shop_name'        => 'Digital Keys Shop',
-    'currency'         => 'USD',   // wallet currency (ISO code)
+    'currency'         => 'USD',   // wallet currency (keep USD: USDT is 1:1, BTC is converted at live price)
     'currency_symbol'  => '$',
     'support_username' => 'YourSupportUsername', // without @
     'timezone'         => 'UTC',
@@ -26,7 +26,7 @@ return [
     'notify_admin_sales'    => true,  // DM admins on every sale
     'notify_admin_deposits' => true,  // DM admins on every deposit
 
-    // ---- Deposits -------------------------------------------------------
+    // ---- Deposits (USD amounts) -----------------------------------------
     'deposit' => [
         'min'     => 5,
         'max'     => 1000,
@@ -42,25 +42,37 @@ return [
         'pass' => 'database_password',
     ],
 
-    // ---- Payment gateways -----------------------------------------------
-    // Crypto payments: https://nowpayments.io (Store settings > API key + IPN secret)
-    'nowpayments' => [
-        'enabled'    => true,
-        'api_key'    => 'YOUR_NOWPAYMENTS_API_KEY',
-        'ipn_secret' => 'YOUR_NOWPAYMENTS_IPN_SECRET',
-        'sandbox'    => false,
-        // Payment statuses that credit the wallet. 'finished' is the safest.
-        'credit_statuses' => ['finished'],
-    ],
+    // ---- Crypto wallets (payments go DIRECTLY to you, no gateway) --------
+    // Deposits are verified automatically on the blockchain.
+    // Use addresses from a wallet YOU control (Trust Wallet, TronLink, Electrum...).
+    // Exchange deposit addresses also work, but some exchanges credit late or merge transfers.
+    'crypto' => [
+        'expiry_minutes' => 60, // how long a user has to pay a deposit
 
-    // Card / bank transfer / USSD: https://paystack.com (Settings > API Keys & Webhooks)
-    'paystack' => [
-        'enabled'    => false,
-        'secret_key' => 'YOUR_PAYSTACK_SECRET_KEY',
-        'currency'   => 'NGN',
-        // How many units of the Paystack currency equal 1 unit of wallet currency.
-        // e.g. wallet in USD, Paystack in NGN at 1 USD = 1600 NGN -> 1600.
-        // If your wallet currency is also NGN, set to 1.
-        'rate'       => 1600,
+        // USDT on TRON (TRC20). Address starts with T...
+        'trc20' => [
+            'enabled' => true,
+            'address' => 'TYourTronAddressHere',
+            // Optional but recommended: free key from https://www.trongrid.io (avoids rate limits)
+            'trongrid_api_key' => '',
+        ],
+
+        // USDT on BNB Smart Chain (BEP20). Address starts with 0x...
+        'bep20' => [
+            'enabled' => true,
+            'address' => '0xYourBscAddressHere',
+            // Public BSC RPC. Alternatives: https://bsc-dataseed.bnbchain.org , https://bsc.drpc.org
+            'rpc' => 'https://bsc-rpc.publicnode.com',
+            'confirmations' => 15,
+            'log_chunk' => 1000, // blocks per request; lower it if your RPC complains about block range
+        ],
+
+        // Bitcoin. Address starts with bc1..., 1... or 3...
+        'btc' => [
+            'enabled' => true,
+            'address' => 'bc1YourBitcoinAddressHere',
+            'confirmations' => 1,
+            'api' => 'https://mempool.space/api', // or https://blockstream.info/api
+        ],
     ],
 ];

@@ -6,9 +6,11 @@ A fully automated Telegram shop for digital keys. It runs on any ordinary **cPan
 
 **For customers (all buttons):**
 - 📊 **Dashboard**: balance, order count, total spent, user ID
-- 💳 **Wallet deposits** that confirm automatically:
-  - 🪙 Crypto via **NOWPayments** (BTC, USDT, LTC, ETH, 100+ coins)
-  - 💳 Card / bank transfer via **Paystack** (optional)
+- 💳 **Crypto wallet deposits straight to YOUR addresses, with no payment gateway:**
+  - 💵 **USDT TRC20** (Tron)
+  - 💵 **USDT BEP20** (BNB Smart Chain)
+  - ₿ **Bitcoin**
+  - Verified **automatically on the blockchain**. No middleman, no fees, no KYC with a gateway.
 - 🛒 **Shop**: categories → products → choose quantity → confirm → **keys delivered instantly**
 - 📦 **My Orders**: view purchased keys again any time
 - 📜 **Wallet history** of every deposit and purchase
@@ -26,8 +28,9 @@ A fully automated Telegram shop for digital keys. It runs on any ordinary **cPan
 
 **Safety built in:**
 - Webhook secret verification, so only Telegram can talk to the bot
-- Signed IPNs (HMAC-SHA512) for NOWPayments and Paystack, and Paystack payments are double-checked through its API
-- Each deposit is credited **exactly once**, even if the gateway sends the IPN several times
+- Every blockchain transaction can be used **only once**, so a TXID can't be replayed or claimed by two users
+- A TXID sent *before* a deposit was created can't be claimed for it
+- Each deposit is credited **exactly once**
 - Purchases run in a database transaction, so a key is never sold twice and balances can't go negative
 - One-time confirm tokens, so double-tapping "Confirm" can't buy twice
 
@@ -61,7 +64,7 @@ cPanel → **MySQL® Databases**:
    - `webhook_secret`: a random string of letters/numbers, 20+ characters
    - `base_url`: e.g. `https://yourdomain.com/bot`
    - `db`: the database name, user and password from step 2
-   - your payment gateway keys (see below)
+   - your **USDT TRC20 / USDT BEP20 / BTC addresses** in the `crypto` section
 
 ### 4. Run setup
 Open this in your browser:
@@ -70,32 +73,52 @@ Open this in your browser:
 https://yourdomain.com/bot/setup.php?key=YOUR_WEBHOOK_SECRET
 ```
 
-It creates the tables, connects the bot to Telegram and prints the payment callback URLs. You should see all ✅.
+It creates the tables, connects the bot to Telegram, checks your wallet addresses and prints the cron command. You should see all ✅.
 
-### 5. Add products
+### 5. Add the cron job
+See [Setting up the cron job](#setting-up-the-cron-job-important) below.
+
+### 6. Add products
 Open your bot → `/admin` → **Catalog** → **Add Category** → **Add Product** → paste or upload the keys.
 
 That's it. Customers send `/start`.
 
 ---
 
-## Payment gateway setup
+## How deposits work (no gateway)
 
-### NOWPayments (crypto)
-1. Sign up at [nowpayments.io](https://nowpayments.io) and add your payout wallet.
-2. **Store Settings** → create an **API key** → put it in `nowpayments.api_key`.
-3. **Store Settings → Instant Payment Notifications** → generate an **IPN secret** → put it in `nowpayments.ipn_secret`.
-4. You don't need to paste a callback URL. The bot sends `https://yourdomain.com/bot/ipn/nowpayments.php` with each invoice.
+1. The user picks an amount (e.g. $10) and a network.
+2. The bot shows **your address** and a **unique amount**, e.g. `10.0372 USDT` (USDT is 1:1 with USD; BTC is converted at the live price). The extra decimals (at most $0.10) identify which user paid.
+3. The **cron job** (every minute) or the user's **🔄 Check Payment** button scans your address on the blockchain. When a transfer with that exact amount arrives and is confirmed, the user's wallet is credited and they get a message.
+4. **If the user sent a different amount** (for example, their exchange deducted a withdrawal fee), they tap **🧾 Submit TXID** and paste the transaction hash. The bot checks that transaction on-chain and credits **what actually arrived**.
+5. Payments that match no deposit are reported to admins with an explorer link.
 
-By default the wallet is credited when the payment status is `finished`. You can add `confirmed` to `credit_statuses` to credit a little faster.
+Deposits expire after 60 minutes (configurable). A payment that arrives late is still credited.
 
-### Paystack (cards, bank transfer, USSD)
-1. In `config.php` set `paystack.enabled => true` and add your **secret key**.
-2. Paystack Dashboard → **Settings → API Keys & Webhooks** → set the Webhook URL to:
-   `https://yourdomain.com/bot/ipn/paystack.php`
-3. If your wallet currency is USD but Paystack charges in NGN, set `paystack.rate` (e.g. `1600`). The bot shows the user the NGN amount.
+### Blockchain data sources (all free, no signup)
+| Network | Source | Notes |
+|---|---|---|
+| USDT TRC20 | TronGrid API | A free API key from [trongrid.io](https://www.trongrid.io) is recommended (`trongrid_api_key`) to avoid rate limits |
+| USDT BEP20 | BSC public RPC (`bsc-rpc.publicnode.com`) | Change `rpc` if it's slow; confirmations default 15 |
+| BTC | mempool.space API | Or `https://blockstream.info/api`; confirmations default 1 |
+| BTC price | Coinbase → Kraken → CoinGecko → Binance | Automatic fallback |
 
-You can enable either gateway or both. With both enabled, users pick one.
+### Setting up the cron job (important)
+cPanel → **Cron Jobs** → *Once Per Minute* (`* * * * *`) → command:
+
+```
+php /home/YOURUSER/public_html/bot/cron.php >/dev/null 2>&1
+```
+
+`setup.php` prints the exact path for your account. If your host has no command-line PHP, use:
+`wget -q -O /dev/null "https://yourdomain.com/bot/cron.php?key=YOUR_WEBHOOK_SECRET"`
+
+The cron job only calls the blockchain APIs while there are open deposits, so it is very light. Without cron, deposits are still credited when users tap **Check Payment**, but not automatically.
+
+### Wallet tips
+- Use addresses from a wallet **you control** (Trust Wallet, TronLink, MetaMask for BSC, Electrum/BlueWallet for BTC).
+- Use a **dedicated address** for the shop, not one that already receives lots of other payments.
+- A TRON address needs a little TRX to *send* USDT later. Receiving is free.
 
 ---
 
@@ -107,14 +130,11 @@ bot/
 ├── setup.php            ← one-time installer (safe to re-run)
 ├── config.php           ← your settings (create from config.sample.php)
 ├── install.sql          ← database schema (setup.php runs it for you)
-├── ipn/
-│   ├── nowpayments.php  ← crypto payment callback
-│   ├── paystack.php     ← card payment callback
-│   └── return.php       ← "thank you" page after paying
+├── cron.php           ← checks the blockchain for deposits (run every minute)
 ├── src/                 ← bot logic (blocked from web access)
 │   ├── bot.php          ← customer menus, shop, wallet, purchase
 │   ├── admin.php        ← admin panel
-│   ├── payments.php     ← gateways + auto-credit
+│   ├── crypto.php       ← on-chain deposit verification (TRON, BSC, BTC)
 │   ├── telegram.php     ← Telegram API helpers
 │   └── helpers.php
 └── storage/error.log    ← errors are logged here (blocked from web access)
@@ -128,10 +148,10 @@ bot/
 |---|---|
 | Bot doesn't reply | Re-open `setup.php?key=…` and read any ⚠️ line. Check that `base_url` is HTTPS and correct. Check `storage/error.log`. |
 | "SSL certificate problem" in the webhook error | Enable AutoSSL in cPanel → SSL/TLS Status. |
-| Deposits don't credit | Check `storage/error.log` for "bad signature" (wrong IPN secret / Paystack key) or "amount mismatch". Make sure ModSecurity isn't blocking `/ipn/` (ask your host). |
+| Deposits don't credit | Check that the cron job runs (run `php cron.php` in cPanel Terminal, it prints what it scanned). Check `storage/error.log` for API errors. For TRON rate limits add a TronGrid API key. For BSC timeouts try another `rpc` or lower `log_chunk`. The user can always use **Submit TXID**. |
 | Broadcast stops early on a large user list | Some hosts kill long scripts. Ask the host to raise `max_execution_time`, or broadcast in smaller batches. |
 | 500 error | Usually a typo in `config.php`, or PHP < 8.0. Select PHP 8.x in cPanel → **MultiPHP Manager**. |
 
 **Admin tips:**
 - Users can type `/cancel` to stop any text input.
-- Only sell keys you have the right to resell. Check the terms of each gateway for allowed product types.
+- Only sell keys you have the right to resell.

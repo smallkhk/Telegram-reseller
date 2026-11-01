@@ -29,6 +29,8 @@ function db(): PDO
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
             PDO::ATTR_EMULATE_PREPARES   => false,
         ]);
+        // Keep MySQL's NOW() in the same timezone as PHP so expiry times line up.
+        $pdo->exec("SET time_zone = '" . date('P') . "'");
     }
     return $pdo;
 }

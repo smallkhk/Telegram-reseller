@@ -12,7 +12,7 @@ $GLOBALS['config'] = require $cfgFile;
 
 require __DIR__ . '/helpers.php';
 require __DIR__ . '/telegram.php';
-require __DIR__ . '/payments.php';
+require __DIR__ . '/crypto.php';
 require __DIR__ . '/bot.php';
 require __DIR__ . '/admin.php';
 

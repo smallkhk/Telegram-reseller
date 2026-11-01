@@ -103,6 +103,11 @@ function handle_state(array $user, array $m): void
         return;
     }
 
+    if ($state === 'dep_txid') {
+        submit_txid($user, $chatId, (int)$user['state_data'], $text);
+        return;
+    }
+
     if (str_starts_with($state, 'a_')) {
         if (!is_admin($uid)) {
             set_state($uid, null);
@@ -182,8 +187,40 @@ function handle_callback(array $cq): void
             case 'dg':
                 start_deposit($user, $chatId, $msgId, (string)($p[1] ?? ''), (float)($p[2] ?? 0));
                 break;
+            case 'dv':
+                [$t, $k] = deposit_invoice_view($uid, (int)($p[1] ?? 0));
+                edit($chatId, $msgId, $t, $k);
+                break;
             case 'dk':
-                check_deposit($user, (int)($p[1] ?? 0));
+                check_deposit($user, $chatId, $msgId, (int)($p[1] ?? 0));
+                break;
+            case 'dt':
+                $dep = q("SELECT * FROM deposits WHERE id=? AND user_id=? AND status IN ('pending','expired')", [(int)($p[1] ?? 0), $uid])->fetch();
+                if (!$dep) {
+                    toast('This deposit is no longer open.', true);
+                    break;
+                }
+                set_state($uid, 'dep_txid', $dep['id']);
+                edit($chatId, $msgId, "🧾 <b>Submit TXID for deposit #{$dep['id']}</b>\n\n"
+                    . 'Paste the <b>transaction hash (TXID)</b> of your ' . e(chain_info($dep['chain'])['label']) . " payment.\n\n"
+                    . "<i>Use this if you sent a different amount than shown (e.g. your exchange deducted a fee). You'll be credited the amount that actually arrived.</i>",
+                    kb([[btn('❌ Cancel', 'dv:' . $dep['id'])]]));
+                break;
+            case 'dx':
+                edit($chatId, $msgId, "❌ Cancel deposit #" . (int)($p[1] ?? 0) . "?\n\n⚠️ <b>Do not send any payment</b> for it after cancelling.", kb([
+                    [btn('✅ Yes, cancel it', 'dxy:' . (int)($p[1] ?? 0))],
+                    [btn('⬅️ No, go back', 'dv:' . (int)($p[1] ?? 0))],
+                ]));
+                break;
+            case 'dxy':
+                q("UPDATE deposits SET status='cancelled' WHERE id=? AND user_id=? AND status IN ('pending','expired')", [(int)($p[1] ?? 0), $uid]);
+                toast('Deposit cancelled.');
+                [$t, $k] = deposit_view(get_user($uid));
+                edit($chatId, $msgId, $t, $k);
+                break;
+            case 'dl':
+                [$t, $k] = pending_deposits_view($uid);
+                edit($chatId, $msgId, $t, $k);
                 break;
             case 'ord':
                 [$t, $k] = orders_view($uid);
@@ -362,11 +399,17 @@ function deposit_view(array $user): array
         $rows[] = array_map(fn($a) => btn(money($a), 'da:' . $a), $chunk);
     }
     $rows[] = [btn('✏️ Custom amount', 'dc')];
+    $open = (int)q("SELECT COUNT(*) FROM deposits WHERE user_id=? AND status='pending'", [$user['id']])->fetchColumn();
+    if ($open > 0) {
+        $rows[] = [btn("📋 My pending deposits ({$open})", 'dl')];
+    }
     $rows[] = back_home();
+    $nets = implode(', ', array_map(fn($c) => $c['label'], chains_enabled())) ?: '—';
     $text = "💳 <b>Deposit funds</b>\n\n"
         . '💰 Current balance: <b>' . money($user['balance']) . "</b>\n\n"
-        . "Choose how much you want to add to your wallet.\n"
-        . 'Payments are confirmed <b>automatically</b> ⚡';
+        . "🌐 Accepted: {$nets}\n\n"
+        . "Choose how much you want to add (in USD).\n"
+        . 'Payments are verified on the blockchain <b>automatically</b> ⚡';
     return [$text, kb($rows)];
 }
 
@@ -378,24 +421,24 @@ function deposit_method(array $user, int $chatId, ?int $msgId, float $amount): v
         edit($chatId, $msgId, '⚠️ Amount must be between ' . money($min) . ' and ' . money($max) . '.', kb([[btn('⬅️ Back', 'dep')]]));
         return;
     }
-    $gws = gateways_enabled();
-    if (!$gws) {
+    $chains = chains_enabled();
+    if (!$chains) {
         edit($chatId, $msgId, '⚠️ Deposits are temporarily unavailable. Please contact support.', kb([back_home()]));
         return;
     }
-    if (count($gws) === 1) {
-        start_deposit($user, $chatId, $msgId, (string)array_key_first($gws), $amount);
+    if (count($chains) === 1) {
+        start_deposit($user, $chatId, $msgId, (string)array_key_first($chains), $amount);
         return;
     }
     $rows = [];
-    foreach ($gws as $key => $label) {
-        $rows[] = [btn($label, "dg:{$key}:" . dec($amount))];
+    foreach ($chains as $key => $c) {
+        $rows[] = [btn($c['btn'], "dg:{$key}:" . dec($amount))];
     }
     $rows[] = [btn('⬅️ Back', 'dep')];
-    edit($chatId, $msgId, '💳 Deposit <b>' . money($amount) . "</b>\n\nChoose a payment method:", kb($rows));
+    edit($chatId, $msgId, '💳 Deposit <b>' . money($amount) . "</b>\n\nChoose the coin / network you will pay with:", kb($rows));
 }
 
-function start_deposit(array $user, int $chatId, ?int $msgId, string $gw, float $amount): void
+function start_deposit(array $user, int $chatId, ?int $msgId, string $chain, float $amount): void
 {
     $min = (float)cfg('deposit.min', 1);
     $max = (float)cfg('deposit.max', 10000);
@@ -403,50 +446,141 @@ function start_deposit(array $user, int $chatId, ?int $msgId, string $gw, float 
         edit($chatId, $msgId, '⚠️ Invalid amount.', kb([[btn('⬅️ Back', 'dep')]]));
         return;
     }
-    edit($chatId, $msgId, '⏳ Creating your payment link…');
-    $r = create_deposit($user, $gw, $amount);
+    $r = create_crypto_deposit($user, $chain, $amount);
     if (!$r['ok']) {
         edit($chatId, $msgId, '❌ ' . e($r['error']), kb([[btn('⬅️ Back', 'dep')], back_home()]));
         return;
     }
-    $extra = '';
-    if ($gw === 'ps' && strtoupper((string)cfg('paystack.currency')) !== strtoupper((string)cfg('currency'))) {
-        $local = round($amount * (float)cfg('paystack.rate', 1), 2);
-        $extra = "\n💱 You will pay: <b>" . number_format($local, 2) . ' ' . e(cfg('paystack.currency')) . '</b>';
-    }
-    $text = "🧾 <b>Deposit #{$r['id']}</b>\n\n"
-        . '💵 Amount: <b>' . money($amount) . "</b>\n"
-        . '💳 Method: <b>' . gateway_label($gw) . "</b>{$extra}\n\n"
-        . "👉 Tap <b>Pay Now</b> to complete the payment.\n"
-        . "Your wallet will be credited <b>automatically</b> once the payment is confirmed — you'll get a message here."
-        . ($gw === 'now' ? "\n\n<i>Crypto payments may take a few minutes to confirm on the network.</i>" : '');
-    edit($chatId, $msgId, $text, kb([
-        [urlbtn('💳 Pay Now', $r['url'])],
-        [btn('🔄 Check Status', 'dk:' . $r['id'])],
-        back_home(),
-    ]));
+    [$t, $k] = deposit_invoice_view((int)$user['id'], (int)$r['deposit']['id']);
+    edit($chatId, $msgId, $t, $k);
 }
 
-function check_deposit(array $user, int $depId): void
+function deposit_invoice_view(int $uid, int $depId, string $note = ''): array
 {
-    $dep = q('SELECT * FROM deposits WHERE id=? AND user_id=?', [$depId, $user['id']])->fetch();
+    $dep = q('SELECT * FROM deposits WHERE id=? AND user_id=?', [$depId, $uid])->fetch();
+    if (!$dep) {
+        return ['❌ Deposit not found.', kb([[btn('⬅️ Back', 'dep')]])];
+    }
+    $info = chain_info($dep['chain']);
+    $pay = norm_dec((string)$dep['pay_amount']);
+    $head = "🧾 <b>Deposit #{$dep['id']}</b> — " . money($dep['amount']) . "\n\n";
+
+    if ($dep['status'] === 'paid') {
+        return [$head . '✅ <b>Paid</b> — ' . money($dep['credited']) . ' was added to your wallet.', kb([
+            [urlbtn('🔍 View transaction', $info['explorer'] . $dep['txid'])],
+            [btn('🛒 Shop', 'shop'), btn('🏠 Dashboard', 'home')],
+        ])];
+    }
+    if ($dep['status'] === 'cancelled') {
+        return [$head . '❌ This deposit was cancelled.', kb([[btn('💳 New deposit', 'dep')], back_home()])];
+    }
+
+    $left = strtotime($dep['expires_at']) - time();
+    $timer = $dep['status'] === 'expired' || $left <= 0
+        ? "⌛ <b>Expired.</b> If you already paid, it will still be credited — tap Check Payment or Submit TXID.\n"
+        : '⏳ Time left: <b>' . max(1, (int)ceil($left / 60)) . " min</b>\n";
+
+    $text = $head
+        . '🌐 Network: <b>' . e($info['network']) . "</b>\n\n"
+        . "1️⃣ Send <b>EXACTLY</b> this amount (tap to copy):\n"
+        . "<code>{$pay}</code> <b>{$info['coin']}</b>\n"
+        . ($dep['chain'] === 'btc' ? '<i>(BTC rate: ' . money($dep['rate']) . ")</i>\n" : '')
+        . "\n2️⃣ To this address (tap to copy):\n"
+        . '<code>' . e(chain_address($dep['chain'])) . "</code>\n\n"
+        . $timer
+        . "\n⚠️ Send <b>only {$info['coin']} on {$info['network']}</b>. Other coins/networks will be lost.\n"
+        . "⚠️ The exact decimals identify your payment. If your exchange deducts a fee, use <b>Submit TXID</b> after sending.\n\n"
+        . '✅ Your wallet is credited automatically after network confirmation.'
+        . ($dep['claim_txid'] ? "\n\n🔎 TXID submitted — checking: <code>" . e(substr($dep['claim_txid'], 0, 20)) . '…</code>' : '')
+        . ($note !== '' ? "\n\n" . $note : '');
+
+    return [$text, kb([
+        [btn('🔄 Check Payment', 'dk:' . $dep['id'])],
+        [btn('🧾 Submit TXID', 'dt:' . $dep['id']), btn('❌ Cancel', 'dx:' . $dep['id'])],
+        back_home(),
+    ])];
+}
+
+function pending_deposits_view(int $uid): array
+{
+    $deps = q("SELECT * FROM deposits WHERE user_id=? AND status='pending' ORDER BY id DESC", [$uid])->fetchAll();
+    if (!$deps) {
+        return ['No pending deposits.', kb([[btn('⬅️ Back', 'dep')]])];
+    }
+    $rows = [];
+    foreach ($deps as $d) {
+        $rows[] = [btn("#{$d['id']} • " . money($d['amount']) . ' • ' . chain_short($d['chain']), 'dv:' . $d['id'])];
+    }
+    $rows[] = [btn('⬅️ Back', 'dep')];
+    return ["📋 <b>Pending deposits</b>\n\nTap one to see the payment details:", kb($rows)];
+}
+
+function check_deposit(array $user, int $chatId, ?int $msgId, int $depId): void
+{
+    $uid = (int)$user['id'];
+    $dep = q('SELECT * FROM deposits WHERE id=? AND user_id=?', [$depId, $uid])->fetch();
     if (!$dep) {
         toast('Deposit not found.', true);
         return;
     }
+    if (in_array($dep['status'], ['pending', 'expired'], true)) {
+        scan_chain($dep['chain']);
+        if ($dep['claim_txid']) {
+            verify_txid($dep, $dep['claim_txid']);
+        }
+        $dep = q('SELECT * FROM deposits WHERE id=?', [$depId])->fetch();
+    }
     if ($dep['status'] === 'paid') {
-        toast('✅ This deposit has already been credited to your wallet.', true);
-        return;
-    }
-    if ($dep['status'] !== 'pending') {
-        toast('❌ This deposit is ' . $dep['status'] . '. Please create a new one.', true);
-        return;
-    }
-    if ($dep['gateway'] === 'ps' && paystack_verify_and_credit($dep)) {
         toast('✅ Payment confirmed! Your wallet has been credited.', true);
+    } elseif ($dep['status'] === 'cancelled') {
+        toast('This deposit was cancelled.', true);
+    } else {
+        toast("⏳ Payment not detected yet.\n\nBlockchain confirmations can take a few minutes (BTC: 10–30 min). You'll get a message as soon as it arrives.", true);
+    }
+    [$t, $k] = deposit_invoice_view($uid, $depId, '🕐 Last checked: ' . date('H:i:s'));
+    edit($chatId, $msgId, $t, $k);
+}
+
+function submit_txid(array $user, int $chatId, int $depId, string $text): void
+{
+    $uid = (int)$user['id'];
+    $dep = q("SELECT * FROM deposits WHERE id=? AND user_id=? AND status IN ('pending','expired')", [$depId, $uid])->fetch();
+    if (!$dep) {
+        set_state($uid, null);
+        send($chatId, 'This deposit is no longer open.', kb([[btn('💳 Deposit', 'dep')]]));
         return;
     }
-    toast("⏳ Payment not confirmed yet.\n\nIf you've already paid, please wait — your wallet is credited automatically once the payment is confirmed.", true);
+    $txid = normalize_txid($dep['chain'], $text);
+    if (!txid_valid($dep['chain'], $txid)) {
+        send($chatId, '⚠️ That does not look like a valid ' . e(chain_info($dep['chain'])['label']) . ' transaction hash. Please paste the TXID again:', kb([[btn('❌ Cancel', 'dv:' . $depId)]]));
+        return;
+    }
+    $used = q('SELECT 1 FROM chain_txs WHERE chain=? AND txid=? AND deposit_id IS NOT NULL', [$dep['chain'], $txid])->fetchColumn();
+    $claimed = q("SELECT 1 FROM deposits WHERE claim_txid=? AND id<>? AND status IN ('pending','expired')", [$txid, $depId])->fetchColumn();
+    if ($used || $claimed) {
+        set_state($uid, null);
+        send($chatId, '❌ This transaction has already been used for another deposit.', kb([[btn('⬅️ Back', 'dv:' . $depId)]]));
+        return;
+    }
+    set_state($uid, null);
+    send($chatId, '🔎 Checking the transaction on the blockchain…');
+
+    $r = verify_txid($dep, $txid);
+    switch ($r['status']) {
+        case 'credited':
+            return; // credit_deposit() already messaged the user
+        case 'unconfirmed':
+        case 'not_found':
+            q('UPDATE deposits SET claim_txid=? WHERE id=?', [$txid, $depId]);
+            $msg = $r['status'] === 'unconfirmed'
+                ? "⏳ Transaction found! Waiting for network confirmations — your wallet will be credited automatically."
+                : "🔎 We couldn't see a payment to our address in this transaction yet. We'll keep checking automatically for 24 hours.\n\nMake sure you sent <b>" . e(chain_info($dep['chain'])['label']) . '</b> to the correct address.';
+            [$t, $k] = deposit_invoice_view($uid, $depId, $msg);
+            send($chatId, $t, $k);
+            return;
+        default:
+            send($chatId, '❌ TXID not accepted: ' . e(txid_status_text($r['status'])) . '.', kb([[btn('⬅️ Back', 'dv:' . $depId)], [btn('🆘 Support', 'sup')]]));
+    }
 }
 
 function orders_view(int $uid): array
