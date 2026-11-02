@@ -549,7 +549,7 @@ function deposit_invoice_view(int $uid, int $depId, string $note = ''): array
         . "<code>{$pay}</code> <b>{$info['coin']}</b>\n"
         . ($dep['chain'] === 'btc' ? '<i>(BTC rate: ' . money($dep['rate']) . ")</i>\n" : '')
         . "\n2️⃣ To this address (tap to copy):\n"
-        . '<code>' . e(chain_address($dep['chain'])) . "</code>\n\n"
+        . '<code>' . e(($dep['pay_address'] ?? '') ?: chain_address($dep['chain'])) . "</code>\n\n"
         . $timer
         . "\n⚠️ Send <b>only {$info['coin']} on {$info['network']}</b>. Other coins/networks will be lost.\n"
         . "⚠️ The exact decimals identify your payment. If your exchange deducts a fee, use <b>Submit TXID</b> after sending.\n\n"

@@ -147,7 +147,7 @@ function finish_request(): void
  */
 function migrate_schema(bool $force = false): void
 {
-    $target = 3;
+    $target = 4;
     try {
         $v = (int)(q("SELECT v FROM settings WHERE k='schema_version'")->fetchColumn() ?: 1);
     } catch (Throwable $e) {
@@ -174,6 +174,8 @@ function migrate_schema(bool $force = false): void
             created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
             UNIQUE KEY uniq_claim (chain, txid, user_id)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4',
+        // v4: remember which address each deposit showed (addresses can be changed in the bot)
+        'ALTER TABLE deposits ADD COLUMN pay_address VARCHAR(100) NULL',
     ];
     foreach ($alters as $sql) {
         try {
@@ -224,4 +226,41 @@ function report_error_to_admins(Throwable $e): void
         notify_admins("⚠️ <b>Bot error</b> (the bot kept running):\n<code>" . e(mb_substr($e->getMessage(), 0, 300)) . "</code>\n\nIf this keeps happening, send this message to your developer.");
     } catch (Throwable $ignored) {
     }
+}
+
+/**
+ * Save a changed setting into config.php (safely: write a temp file, then swap it in).
+ * Returns true on success.
+ */
+function save_config_value(array $path, $value): bool
+{
+    $file = APP_ROOT . '/config.php';
+    $cfg = require $file;
+    $ref = &$cfg;
+    foreach ($path as $k) {
+        if (!isset($ref[$k]) || !is_array($ref[$k])) {
+            $ref[$k] = $ref[$k] ?? [];
+        }
+        $ref = &$ref[$k];
+    }
+    $ref = $value;
+    unset($ref);
+
+    $php = "<?php\n// Settings for your shop bot. Updated " . date('Y-m-d H:i') . ".\nreturn " . var_export($cfg, true) . ";\n";
+    $tmp = $file . '.tmp' . bin2hex(random_bytes(3));
+    if (@file_put_contents($tmp, $php, LOCK_EX) === false) {
+        return false;
+    }
+    @chmod($tmp, fileperms($file) & 0777);
+    // Make sure the new file is valid before replacing the old one.
+    $check = @include $tmp;
+    if (!is_array($check) || !@rename($tmp, $file)) {
+        @unlink($tmp);
+        return false;
+    }
+    if (function_exists('opcache_invalidate')) {
+        @opcache_invalidate($file, true);
+    }
+    $GLOBALS['config'] = $cfg;
+    return true;
 }

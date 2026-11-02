@@ -49,7 +49,12 @@ function chains_enabled(): array
 
 function chain_address(string $chain): string
 {
-    $a = trim((string)cfg("crypto.$chain.address"));
+    return normalize_address($chain, (string)cfg("crypto.$chain.address"));
+}
+
+function normalize_address(string $chain, string $a): string
+{
+    $a = trim($a);
     if ($chain === 'bep20') {
         return strtolower($a);
     }
@@ -57,6 +62,41 @@ function chain_address(string $chain): string
         return strtolower($a);
     }
     return $a;
+}
+
+function address_valid(string $chain, string $a): bool
+{
+    $p = [
+        'trc20' => '/^T[1-9A-HJ-NP-Za-km-z]{33}$/',
+        'bep20' => '/^0x[0-9a-fA-F]{40}$/',
+        'btc'   => '/^(bc1[02-9ac-hj-np-z]{11,71}|[13][1-9A-HJ-NP-Za-km-z]{25,34})$/i',
+    ];
+    return isset($p[$chain]) && (bool)preg_match($p[$chain], trim($a));
+}
+
+/**
+ * Addresses to watch for a network: the current one, plus any older address that is
+ * still shown on an open deposit (so payments made after an address change still count).
+ */
+function watched_addresses(string $chain): array
+{
+    $list = [];
+    $cur = chain_address($chain);
+    if ($cur !== '') {
+        $list[] = $cur;
+    }
+    try {
+        $old = q(
+            "SELECT DISTINCT pay_address FROM deposits WHERE chain=? AND pay_address IS NOT NULL AND status IN ('pending','expired') AND created_at > NOW() - INTERVAL 1 DAY",
+            [$chain]
+        )->fetchAll(PDO::FETCH_COLUMN);
+        foreach ($old as $a) {
+            $list[] = normalize_address($chain, (string)$a);
+        }
+    } catch (Throwable $e) {
+        // column not there yet (before the automatic upgrade)
+    }
+    return array_values(array_unique(array_filter($list)));
 }
 
 function txid_valid(string $chain, string $txid): bool
@@ -233,8 +273,8 @@ function create_crypto_deposit(array $user, string $chain, float $usd): array
 
     $minutes = max(10, (int)cfg('crypto.expiry_minutes', 60));
     q(
-        'INSERT INTO deposits (user_id, chain, amount, pay_amount, rate, expires_at) VALUES (?,?,?,?,?, NOW() + INTERVAL ' . $minutes . ' MINUTE)',
-        [$uid, $chain, dec($usd), $pay, $rate !== null ? dec($rate) : null]
+        'INSERT INTO deposits (user_id, chain, amount, pay_amount, rate, pay_address, expires_at) VALUES (?,?,?,?,?,?, NOW() + INTERVAL ' . $minutes . ' MINUTE)',
+        [$uid, $chain, dec($usd), $pay, $rate !== null ? dec($rate) : null, chain_address($chain)]
     );
     $dep = q('SELECT * FROM deposits WHERE id=?', [(int)db()->lastInsertId()])->fetch();
     return ['ok' => true, 'deposit' => $dep];
@@ -680,7 +720,15 @@ function trongrid_headers(): array
 
 function trc20_incoming(): array
 {
-    $addr = chain_address('trc20');
+    $out = [];
+    foreach (watched_addresses('trc20') as $addr) {
+        $out = array_merge($out, trc20_incoming_for($addr));
+    }
+    return $out;
+}
+
+function trc20_incoming_for(string $addr): array
+{
     $params = [
         'only_to' => 'true',
         'only_confirmed' => 'true',
@@ -767,7 +815,7 @@ function tron_hex_to_addr(string $hex20): string
 function trc20_tx(string $txid): array
 {
     $usdtHex = 'a614f803b6fd780986a42c78ec9c7f77e6ded13c';
-    $ourTopic = str_pad(tron_addr_hex(chain_address('trc20')), 64, '0', STR_PAD_LEFT);
+    $ourTopics = array_map(fn($a) => str_pad(tron_addr_hex($a), 64, '0', STR_PAD_LEFT), watched_addresses('trc20'));
     $headers = array_merge(trongrid_headers(), ['Content-Type: application/json']);
 
     // walletsolidity only knows confirmed (solidified) transactions
@@ -784,7 +832,7 @@ function trc20_tx(string $txid): array
     foreach ($info['log'] ?? [] as $i => $log) {
         if (strtolower($log['address'] ?? '') === $usdtHex
             && ('0x' . strtolower($log['topics'][0] ?? '')) === ERC20_TRANSFER_TOPIC
-            && strtolower($log['topics'][2] ?? '') === $ourTopic) {
+            && in_array(strtolower($log['topics'][2] ?? ''), $ourTopics, true)) {
             $out[] = [
                 'txid' => strtolower($txid),
                 'idx' => 0,
@@ -822,9 +870,9 @@ function bsc_block_time(string $blockHex): int
     return $cache[$blockHex];
 }
 
-function bsc_addr_topic(): string
+function bsc_addr_topics(): array
 {
-    return '0x' . str_pad(substr(chain_address('bep20'), 2), 64, '0', STR_PAD_LEFT);
+    return array_map(fn($a) => '0x' . str_pad(substr($a, 2), 64, '0', STR_PAD_LEFT), watched_addresses('bep20'));
 }
 
 function bsc_log_to_transfer(array $log, bool $confirmed): array
@@ -862,7 +910,7 @@ function bep20_incoming(): array
             'fromBlock' => '0x' . dechex($from),
             'toBlock' => '0x' . dechex($end),
             'address' => USDT_BEP20_CONTRACT,
-            'topics' => [ERC20_TRANSFER_TOPIC, null, bsc_addr_topic()],
+            'topics' => [ERC20_TRANSFER_TOPIC, null, bsc_addr_topics()],
         ]]);
         foreach ((array)$logs as $log) {
             if (!empty($log['removed'])) {
@@ -892,7 +940,7 @@ function bep20_tx(string $txid): array
     foreach ($r['logs'] ?? [] as $log) {
         if (strtolower($log['address'] ?? '') === USDT_BEP20_CONTRACT
             && strtolower($log['topics'][0] ?? '') === ERC20_TRANSFER_TOPIC
-            && strtolower($log['topics'][2] ?? '') === bsc_addr_topic()) {
+            && in_array(strtolower($log['topics'][2] ?? ''), bsc_addr_topics(), true)) {
             $log['blockNumber'] = $log['blockNumber'] ?? $r['blockNumber'];
             $out[] = bsc_log_to_transfer($log, $confirmed);
         }
@@ -919,10 +967,10 @@ function btc_tip(): int
 
 function btc_tx_to_transfer(array $tx, int $tip): ?array
 {
-    $addr = chain_address('btc');
+    $ours = watched_addresses('btc');
     $sats = 0;
     foreach ($tx['vout'] ?? [] as $o) {
-        if (($o['scriptpubkey_address'] ?? '') === $addr) {
+        if (in_array(normalize_address('btc', (string)($o['scriptpubkey_address'] ?? '')), $ours, true)) {
             $sats += (int)$o['value'];
         }
     }
@@ -944,18 +992,20 @@ function btc_tx_to_transfer(array $tx, int $tip): ?array
 function btc_incoming(): array
 {
     $tip = btc_tip();
-    $res = http_request('GET', btc_api() . '/address/' . rawurlencode(chain_address('btc')) . '/txs');
-    if (!is_array($res['json'])) {
-        throw new RuntimeException('BTC API error: ' . substr($res['raw'], 0, 200));
-    }
     $out = [];
-    foreach ($res['json'] as $tx) {
-        $t = btc_tx_to_transfer($tx, $tip);
-        if ($t && $t['confirmed']) {
-            $out[] = $t;
+    foreach (watched_addresses('btc') as $addr) {
+        $res = http_request('GET', btc_api() . '/address/' . rawurlencode($addr) . '/txs');
+        if (!is_array($res['json'])) {
+            throw new RuntimeException('BTC API error: ' . substr($res['raw'], 0, 200));
+        }
+        foreach ($res['json'] as $tx) {
+            $t = btc_tx_to_transfer($tx, $tip);
+            if ($t && $t['confirmed']) {
+                $out[$t['txid']] = $t; // same tx can pay two of our addresses
+            }
         }
     }
-    return $out;
+    return array_values($out);
 }
 
 function btc_tx(string $txid): array

@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS deposits (
     amount DECIMAL(14,2) NOT NULL,
     pay_amount DECIMAL(24,8) NOT NULL,
     rate DECIMAL(18,2) NULL,
+    pay_address VARCHAR(100) NULL,
     credited DECIMAL(14,2) NULL,
     status ENUM('pending','paid','expired','cancelled') NOT NULL DEFAULT 'pending',
     txid VARCHAR(100) NULL,

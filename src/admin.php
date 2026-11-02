@@ -28,7 +28,7 @@ function admin_home_view(): array
     return [$text, kb([
         [btn('🗂 Catalog', 'a:cats'), btn('👤 Find User', 'a:uf')],
         [btn('⭐ Resellers', 'a:rs'), btn('🕵️ TXID Reviews', 'a:rv')],
-        [btn('⏸ On Hold', 'a:hl')],
+        [btn('⏸ On Hold', 'a:hl'), btn('💼 Wallets', 'a:wl')],
         [btn('💳 Deposits', 'a:deps'), btn('🧾 Orders', 'a:ords')],
         [btn('📢 Broadcast', 'a:bc'), btn('🔄 Refresh', 'a:home')],
         [btn('🏠 Dashboard', 'home')],
@@ -231,6 +231,63 @@ function admin_callback(array $user, int $chatId, ?int $msgId, array $p): void
         case 'hl':
             [$t, $k] = admin_held_view();
             break;
+        case 'wl':
+            [$t, $k] = admin_wallets_view();
+            break;
+        case 'we':
+            $chain = (string)($p[1] ?? '');
+            if (!in_array($chain, ['trc20', 'bep20', 'btc'], true)) {
+                return;
+            }
+            set_state($uid, 'a_wallet', $chain);
+            $info = chain_info($chain);
+            $hint = ['trc20' => 'starts with T', 'bep20' => 'starts with 0x', 'btc' => 'starts with bc1, 1 or 3'][$chain];
+            [$t, $k] = ["✏️ <b>New {$info['label']} address</b>\n\nPaste the address ({$hint}).\n\n⚠️ Copy-paste it from your wallet — never type it by hand.", $cancel('a:wl')];
+            break;
+        case 'wok':
+            // Confirmed: the pending address is kept in the admin's state while they confirm.
+            if (($user['state'] ?? '') !== 'a_wallet_confirm' || !str_contains((string)$user['state_data'], '|')) {
+                toast('This confirmation expired. Please start again.', true);
+                [$t, $k] = admin_wallets_view();
+                break;
+            }
+            [$chain, $addr] = explode('|', (string)$user['state_data'], 2);
+            $old = (string)cfg("crypto.$chain.address");
+            if (!address_valid($chain, $addr) || !save_config_value(['crypto', $chain, 'address'], $addr)) {
+                toast('Could not save. Check that config.php is writable (permission 640 or 644).', true);
+                [$t, $k] = admin_wallets_view();
+                break;
+            }
+            if (!cfg("crypto.$chain.enabled")) {
+                save_config_value(['crypto', $chain, 'enabled'], true);
+            }
+            $who = $user['username'] ? '@' . e($user['username']) : e($user['first_name']);
+            notify_admins("🔐 <b>Wallet address changed</b> by {$who} (<code>{$uid}</code>)\n\n"
+                . '🌐 ' . e(chain_info($chain)['label']) . "\n"
+                . '❌ Old: <code>' . e($old ?: '—') . "</code>\n"
+                . '✅ New: <code>' . e($addr) . "</code>\n\n"
+                . "<i>If you did not expect this, change it back immediately in Admin → 💼 Wallets.</i>");
+            toast('✅ Address saved');
+            [$t, $k] = admin_wallets_view();
+            break;
+        case 'wt':
+            $chain = (string)($p[1] ?? '');
+            if (!in_array($chain, ['trc20', 'bep20', 'btc'], true)) {
+                return;
+            }
+            $on = !cfg("crypto.$chain.enabled");
+            if ($on && !address_valid($chain, (string)cfg("crypto.$chain.address"))) {
+                toast('Set an address for this network first.', true);
+                [$t, $k] = admin_wallets_view();
+                break;
+            }
+            if (!save_config_value(['crypto', $chain, 'enabled'], $on)) {
+                toast('Could not save. Check that config.php is writable.', true);
+            } else {
+                toast($on ? '✅ Network turned on' : '⛔ Network turned off');
+            }
+            [$t, $k] = admin_wallets_view();
+            break;
         case 'dpa':
         case 'dpr':
             if ($action === 'dpa') {
@@ -336,6 +393,25 @@ function admin_resellers_view(): array
     $text = "⭐ <b>Resellers</b>\n\n" . ($rows
         ? 'Tap a reseller to manage them.'
         : "No resellers yet.\n\nTo make someone a reseller: tap <b>Find User</b>, send their @username or ID, then tap <b>⭐ Make Reseller</b>. (They must have started the bot first.)");
+    return [$text, kb($kb)];
+}
+
+function admin_wallets_view(): array
+{
+    $text = "💼 <b>Deposit wallets</b>\n\nCustomers pay to these addresses:\n";
+    $kb = [];
+    foreach (['trc20', 'bep20', 'btc'] as $c) {
+        $info = chain_info($c);
+        $addr = (string)cfg("crypto.$c.address");
+        $on = cfg("crypto.$c.enabled") && $addr !== '';
+        $text .= "\n" . ($on ? '✅' : '⛔') . ' <b>' . e($info['label']) . "</b>\n"
+            . ($addr !== '' ? '<code>' . e($addr) . '</code>' : '<i>no address set</i>') . "\n";
+        $kb[] = [btn('✏️ ' . chain_short($c), 'a:we:' . $c), btn($on ? '⛔ Turn off' : '✅ Turn on', 'a:wt:' . $c)];
+    }
+    $pending = (int)q("SELECT COUNT(*) FROM deposits WHERE status='pending'")->fetchColumn();
+    $text .= "\n<i>Changing an address is safe: deposits that already showed the old address are still watched until they finish"
+        . ($pending ? " ({$pending} open right now)" : '') . '.</i>';
+    $kb[] = [btn('⬅️ Admin', 'a:home')];
     return [$text, kb($kb)];
 }
 
@@ -508,6 +584,25 @@ function admin_handle_state(array $user, array $m): void
             send($chatId, $r === 'credited'
                 ? "✅ Deposit #{$sid} credited with <b>" . money($amount) . '</b>.'
                 : "⚠️ Deposit #{$sid} is no longer waiting for review.", kb([[btn('🕵️ TXID Reviews', 'a:rv'), btn('⚙️ Admin', 'a:home')]]));
+            return;
+
+        case 'a_wallet':
+            $chain = (string)$user['state_data'];
+            $addr = normalize_address($chain, preg_replace('/\s+/', '', $text));
+            if (!address_valid($chain, $addr)) {
+                send($chatId, '⚠️ That is not a valid ' . e(chain_info($chain)['label']) . ' address. Please paste it again:', kb([[btn('❌ Cancel', 'a:wl')]]));
+                return;
+            }
+            set_state($uid, 'a_wallet_confirm', $chain . '|' . $addr);
+            send($chatId, "🔍 <b>Please double-check the new address</b>\n\n"
+                . '🌐 ' . e(chain_info($chain)['label']) . "\n"
+                . '<code>' . e($addr) . "</code>\n\n"
+                . "Compare the first and last 6 characters with your wallet:\n"
+                . '<b>' . e(substr($addr, 0, 6)) . '</b> … <b>' . e(substr($addr, -6)) . "</b>\n\n"
+                . 'Customers will pay to this address from now on.', kb([
+                    [btn('✅ Yes, save it', 'a:wok')],
+                    [btn('❌ Cancel', 'a:wl')],
+                ]));
             return;
 
         case 'a_rprice':

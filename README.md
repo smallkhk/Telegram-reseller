@@ -23,6 +23,7 @@ A fully automated Telegram shop for digital keys. It runs on any ordinary **cPan
 - Change prices and descriptions
 - Find a user by ID or @username: add or deduct balance, ban or unban, **⭐ make them a reseller**
 - **Reseller pricing:** every product has a customer price and an optional cheaper ⭐ reseller price. Resellers automatically see and pay their price.
+- **💼 Wallets:** change your USDT TRC20 / BEP20 / BTC addresses or turn a network on/off from inside the bot (with a confirm step and an alert to all admins). Deposits that showed the old address are still watched until they finish
 - **🕵️ TXID Reviews:** approve or reject suspicious payment claims with one tap
 - Recent deposits and orders
 - Broadcast a message (text, photo, video…) to all users
