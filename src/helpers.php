@@ -147,7 +147,7 @@ function finish_request(): void
  */
 function migrate_schema(): void
 {
-    $target = 2;
+    $target = 3;
     try {
         $v = (int)(q("SELECT v FROM settings WHERE k='schema_version'")->fetchColumn() ?: 1);
     } catch (Throwable $e) {
@@ -161,6 +161,19 @@ function migrate_schema(): void
         'ALTER TABLE products ADD COLUMN reseller_price DECIMAL(14,2) NULL',
         'ALTER TABLE deposits ADD COLUMN review TINYINT(1) NOT NULL DEFAULT 0',
         'ALTER TABLE deposits ADD COLUMN review_idx INT NULL',
+        // v3: account holds, sender address, TXID claim log
+        'ALTER TABLE users ADD COLUMN is_held TINYINT(1) NOT NULL DEFAULT 0',
+        'ALTER TABLE users ADD COLUMN hold_reason VARCHAR(255) NULL',
+        'ALTER TABLE chain_txs ADD COLUMN from_addr VARCHAR(100) NULL',
+        'CREATE TABLE IF NOT EXISTS txid_claims (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            chain VARCHAR(10) NOT NULL,
+            txid VARCHAR(100) NOT NULL,
+            user_id BIGINT NOT NULL,
+            deposit_id INT NOT NULL,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE KEY uniq_claim (chain, txid, user_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4',
     ];
     foreach ($alters as $sql) {
         try {

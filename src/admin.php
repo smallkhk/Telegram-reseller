@@ -22,11 +22,13 @@ function admin_home_view(): array
         . "🛒 Sales: <b>{$ord['n']}</b> orders • <b>" . money($ord['total']) . '</b> (today ' . money($ord['today']) . ")\n"
         . "🔑 Keys in stock: <b>{$stock}</b>\n"
         . '⭐ Resellers: <b>' . (int)q('SELECT COUNT(*) FROM users WHERE is_reseller=1')->fetchColumn() . '</b>'
+        . (($held = (int)q('SELECT COUNT(*) FROM users WHERE is_held=1')->fetchColumn()) ? "\n⏸ Accounts on hold: <b>{$held}</b>" : '')
         . (($rev = (int)q("SELECT COUNT(*) FROM deposits WHERE review=1 AND status IN ('pending','expired')")->fetchColumn()) ? "\n🕵️ TXID claims waiting for you: <b>{$rev}</b>" : '');
 
     return [$text, kb([
         [btn('🗂 Catalog', 'a:cats'), btn('👤 Find User', 'a:uf')],
         [btn('⭐ Resellers', 'a:rs'), btn('🕵️ TXID Reviews', 'a:rv')],
+        [btn('⏸ On Hold', 'a:hl')],
         [btn('💳 Deposits', 'a:deps'), btn('🧾 Orders', 'a:ords')],
         [btn('📢 Broadcast', 'a:bc'), btn('🔄 Refresh', 'a:home')],
         [btn('🏠 Dashboard', 'home')],
@@ -108,10 +110,12 @@ function admin_user_view(int $uid): array
         . "🛒 Orders: <b>{$o['n']}</b> (" . money($o['s']) . ")\n"
         . '📅 Joined: ' . e($u['created_at']) . "\n"
         . '👤 Type: <b>' . ($u['is_reseller'] ? '⭐ Reseller' : 'Customer') . "</b>\n"
+        . ($u['is_held'] ? '⏸ <b>ON HOLD</b>: ' . e($u['hold_reason']) . "\n" : '')
         . '🚦 Status: <b>' . ($u['is_banned'] ? 'Banned' : 'Active') . '</b>';
     return [$text, kb([
         [btn('➕ Add Balance', 'a:ub:' . $uid), btn('➖ Deduct Balance', 'a:ud:' . $uid)],
         [btn($u['is_reseller'] ? '👤 Make Normal Customer' : '⭐ Make Reseller', 'a:ures:' . $uid)],
+        [$u['is_held'] ? btn('✅ Release Hold', 'a:urel:' . $uid) : btn('⏸ Put On Hold', 'a:uhold:' . $uid)],
         [btn($u['is_banned'] ? '✅ Unban' : '🚫 Ban', 'a:uban:' . $uid)],
         [btn('⬅️ Admin', 'a:home')],
     ])];
@@ -196,6 +200,36 @@ function admin_callback(array $user, int $chatId, ?int $msgId, array $p): void
             break;
         case 'rv':
             [$t, $k] = admin_reviews_view();
+            break;
+        case 'dpe':
+            set_state($uid, 'a_depamt', $id);
+            send($chatId, "✏️ How much should deposit #{$id} be credited (in " . e(cfg('currency')) . ')? Send a number, e.g. <code>9.50</code>', $cancel('a:rv'));
+            return;
+        case 'tc':
+            $dep = (int)($p[2] ?? 0);
+            $r = admin_credit_tx($id, $dep);
+            $msg = $r === 'credited' ? "✅ Payment credited to deposit #{$dep}." : "⚠️ Could not credit: " . ($r === 'used' ? 'payment already used.' : ($r === 'duplicate' ? 'deposit already paid.' : 'deposit is no longer open.'));
+            toast($msg, true);
+            edit($chatId, $msgId, $msg, kb([[btn('⚙️ Admin Panel', 'a:home')]]));
+            return;
+        case 'urel':
+            q('UPDATE users SET is_held=0, hold_reason=NULL WHERE id=?', [$id]);
+            send($id, '✅ <b>Your account is active again.</b> Thanks for your patience!', kb([[btn('🏠 Dashboard', 'home')]]));
+            toast('Hold released ✅');
+            [$t, $k] = admin_user_view($id);
+            break;
+        case 'uhold':
+            if (is_admin($id)) {
+                toast('You cannot hold an admin.', true);
+                return;
+            }
+            q("UPDATE users SET is_held=1, hold_reason='Put on hold by admin' WHERE id=?", [$id]);
+            send($id, "⏸ <b>Your account is on hold.</b> An admin is reviewing it.", kb([[btn('🆘 Contact Support', 'sup')]]));
+            toast('Account on hold ⏸');
+            [$t, $k] = admin_user_view($id);
+            break;
+        case 'hl':
+            [$t, $k] = admin_held_view();
             break;
         case 'dpa':
         case 'dpr':
@@ -305,6 +339,23 @@ function admin_resellers_view(): array
     return [$text, kb($kb)];
 }
 
+function admin_held_view(): array
+{
+    $rows = q('SELECT * FROM users WHERE is_held=1 ORDER BY id DESC LIMIT 50')->fetchAll();
+    if (!$rows) {
+        return ["⏸ <b>On Hold</b>\n\nNo accounts are on hold. 👍", kb([[btn('⬅️ Admin', 'a:home')]])];
+    }
+    $text = "⏸ <b>Accounts on hold</b>\n";
+    $kb = [];
+    foreach ($rows as $u) {
+        $name = $u['username'] ? '@' . $u['username'] : ($u['first_name'] ?: (string)$u['id']);
+        $text .= "\n• " . e($name) . " (<code>{$u['id']}</code>) — " . e($u['hold_reason']);
+        $kb[] = [btn('👤 ' . $name, 'a:u:' . $u['id']), btn('✅ Release', 'a:urel:' . $u['id'])];
+    }
+    $kb[] = [btn('⬅️ Admin', 'a:home')];
+    return [$text, kb($kb)];
+}
+
 function admin_reviews_view(): array
 {
     $rows = q("SELECT d.*, t.amount AS rx FROM deposits d LEFT JOIN chain_txs t ON t.chain=d.chain AND t.txid=d.claim_txid AND t.idx=d.review_idx WHERE d.review=1 AND d.status IN ('pending','expired') ORDER BY d.id DESC LIMIT 20")->fetchAll();
@@ -317,7 +368,7 @@ function admin_reviews_view(): array
         $info = chain_info($d['chain']);
         $text .= "\n#{$d['id']} • user <code>{$d['user_id']}</code> • asked " . money($d['amount']) . ' • received ' . e(norm_dec((string)$d['rx'])) . ' ' . $info['coin']
             . ' • <a href="' . e($info['explorer'] . $d['claim_txid']) . '">tx</a>';
-        $kb[] = [btn("✅ Approve #{$d['id']}", 'a:dpa:' . $d['id']), btn("❌ Reject #{$d['id']}", 'a:dpr:' . $d['id'])];
+        $kb[] = [btn("✅ #{$d['id']}", 'a:dpa:' . $d['id']), btn("✏️ #{$d['id']}", 'a:dpe:' . $d['id']), btn("❌ #{$d['id']}", 'a:dpr:' . $d['id'])];
     }
     $kb[] = [btn('⬅️ Admin', 'a:home')];
     return [$text, kb($kb)];
@@ -444,6 +495,19 @@ function admin_handle_state(array $user, array $m): void
             set_state($uid, null);
             [$t, $k] = admin_product_view($sid);
             send($chatId, "✅ Price updated.\n\n" . $t, $k);
+            return;
+
+        case 'a_depamt':
+            $amount = parse_amount($text);
+            if ($amount === null) {
+                send($chatId, '⚠️ Send a valid amount, e.g. <code>9.50</code>');
+                return;
+            }
+            set_state($uid, null);
+            $r = approve_claim($sid, $amount);
+            send($chatId, $r === 'credited'
+                ? "✅ Deposit #{$sid} credited with <b>" . money($amount) . '</b>.'
+                : "⚠️ Deposit #{$sid} is no longer waiting for review.", kb([[btn('🕵️ TXID Reviews', 'a:rv'), btn('⚙️ Admin', 'a:home')]]));
             return;
 
         case 'a_rprice':

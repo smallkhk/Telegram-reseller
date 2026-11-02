@@ -51,6 +51,17 @@ function handle_message(array $m): void
 
     $text = trim((string)($m['text'] ?? ''));
 
+    if (!empty($user['is_held']) && !is_admin($uid)) {
+        // Allow sending the screenshot that was requested, nothing else.
+        if (($user['state'] ?? '') === 'dep_proof' && (!empty($m['photo']) || !empty($m['document']))) {
+            handle_state($user, $m);
+            return;
+        }
+        [$t, $k] = held_view($user);
+        send($chatId, $t, $k);
+        return;
+    }
+
     if (str_starts_with($text, '/start') || $text === '/menu') {
         set_state($uid, null);
         [$t, $k] = main_view(get_user($uid));
@@ -103,6 +114,23 @@ function handle_state(array $user, array $m): void
         return;
     }
 
+    if ($state === 'dep_proof') {
+        $depId = (int)$user['state_data'];
+        if (empty($m['photo']) && empty($m['document'])) {
+            send($chatId, '📸 Please send the screenshot as a <b>photo</b> (or tap Skip).', kb([[btn('⏭ Skip', 'dv:' . $depId)]]));
+            return;
+        }
+        set_state($uid, null);
+        $who = $user['username'] ? '@' . e($user['username']) : e($user['first_name']);
+        foreach ((array)cfg('admin_ids', []) as $aid) {
+            send($aid, "📎 <b>Proof for deposit #{$depId}</b> from {$who} (<code>{$uid}</code>):");
+            tg('copyMessage', ['chat_id' => $aid, 'from_chat_id' => $chatId, 'message_id' => $m['message_id']]);
+        }
+        [$t, $k] = deposit_invoice_view($uid, $depId, '✅ Screenshot sent to the admin. You will get a message when it is approved.');
+        send($chatId, $t, $k);
+        return;
+    }
+
     if ($state === 'dep_txid') {
         submit_txid($user, $chatId, (int)$user['state_data'], $text);
         return;
@@ -132,6 +160,15 @@ function handle_callback(array $cq): void
         $uid = (int)$user['id'];
         if ($user['is_banned']) {
             toast('🚫 Your account has been suspended.', true);
+            return;
+        }
+        if (!empty($user['is_held']) && !is_admin($uid)) {
+            if (($p0 = explode(':', $data)[0]) === 'sup') {
+                [$t, $k] = support_view();
+            } else {
+                [$t, $k] = held_view($user);
+            }
+            edit($chatId, $msgId, $t, $k);
             return;
         }
         // Any button press cancels a pending text input.
@@ -250,6 +287,15 @@ function handle_callback(array $cq): void
 // ===========================================================================
 // Views
 // ===========================================================================
+
+function held_view(array $user): array
+{
+    return [
+        "⏸ <b>Your account is on hold.</b>\n\nAn admin is checking a payment on your account. You can't buy or deposit until it's reviewed.\n\n"
+        . '💰 Your balance is safe: <b>' . money($user['balance']) . "</b>\n\nIf you have proof of payment, send it to support.",
+        kb([[btn('🆘 Contact Support', 'sup')]]),
+    ];
+}
 
 function back_home(): array
 {
@@ -542,8 +588,8 @@ function check_deposit(array $user, int $chatId, ?int $msgId, int $depId): void
     }
     if (in_array($dep['status'], ['pending', 'expired'], true)) {
         scan_chain($dep['chain']);
-        if ($dep['claim_txid'] && !$dep['review']) {
-            verify_txid($dep, $dep['claim_txid']);
+        if ($dep['claim_txid'] && !$dep['review'] && empty($user['is_held'])) {
+            claim_txid($dep, $dep['claim_txid']);
         }
         $dep = q('SELECT * FROM deposits WHERE id=?', [$depId])->fetch();
     }
@@ -579,23 +625,21 @@ function submit_txid(array $user, int $chatId, int $depId, string $text): void
         send($chatId, '⚠️ That does not look like a valid ' . e(chain_info($dep['chain'])['label']) . ' transaction hash. Please paste the TXID again:', kb([[btn('❌ Cancel', 'dv:' . $depId)]]));
         return;
     }
-    $used = q('SELECT 1 FROM chain_txs WHERE chain=? AND txid=? AND deposit_id IS NOT NULL', [$dep['chain'], $txid])->fetchColumn();
-    $claimed = q("SELECT 1 FROM deposits WHERE claim_txid=? AND id<>? AND status IN ('pending','expired')", [$txid, $depId])->fetchColumn();
-    if ($used || $claimed) {
-        set_state($uid, null);
-        send($chatId, '❌ This transaction has already been used for another deposit.', kb([[btn('⬅️ Back', 'dv:' . $depId)]]));
-        return;
-    }
     set_state($uid, null);
     send($chatId, '🔎 Checking the transaction on the blockchain…');
 
-    $r = verify_txid($dep, $txid);
+    $r = claim_txid($dep, $txid);
     switch ($r['status']) {
         case 'credited':
             return; // credit_deposit() already messaged the user
+        case 'held':
+            return; // hold_users() already messaged the user
         case 'review':
-            [$t, $k] = deposit_invoice_view($uid, $depId, "🕵️ <b>Payment found.</b> Because the amount or time doesn't match this deposit exactly, the admin will confirm it shortly. You'll get a message here.");
-            send($chatId, $t, $k);
+            set_state($uid, 'dep_proof', $depId);
+            send($chatId, "🕵️ <b>Payment found — an admin will confirm it.</b>\n\n"
+                . "The amount or time doesn't match your deposit exactly, so a person checks it.\n\n"
+                . "📸 <b>Please send a screenshot</b> of the withdrawal/transfer from your wallet or exchange now (as a photo). It helps the admin approve it faster.",
+                kb([[btn('⏭ Skip', 'dv:' . $depId)]]));
             return;
         case 'unconfirmed':
         case 'not_found':
@@ -700,6 +744,9 @@ function purchase(int $uid, int $pid, int $qty): array
             throw new RuntimeException('Not enough stock. Only ' . count($keys) . ' left.');
         }
         $buyer = q('SELECT * FROM users WHERE id=?', [$uid])->fetch();
+        if (!empty($buyer['is_held'])) {
+            throw new RuntimeException('Your account is on hold while an admin checks a payment.');
+        }
         $unit = price_for($buyer ?: [], $prod);
         $total = dec($unit * $qty);
 

@@ -8,6 +8,8 @@ CREATE TABLE IF NOT EXISTS users (
     buy_token VARCHAR(16) NULL,
     is_banned TINYINT(1) NOT NULL DEFAULT 0,
     is_reseller TINYINT(1) NOT NULL DEFAULT 0,
+    is_held TINYINT(1) NOT NULL DEFAULT 0,
+    hold_reason VARCHAR(255) NULL,
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_username (username)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -83,9 +85,20 @@ CREATE TABLE IF NOT EXISTS chain_txs (
     txid VARCHAR(100) NOT NULL,
     idx INT NOT NULL DEFAULT 0,
     amount VARCHAR(80) NOT NULL,
+    from_addr VARCHAR(100) NULL,
     deposit_id INT NULL,
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE KEY uniq_tx (chain, txid, idx)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS txid_claims (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    chain VARCHAR(10) NOT NULL,
+    txid VARCHAR(100) NOT NULL,
+    user_id BIGINT NOT NULL,
+    deposit_id INT NOT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uniq_claim (chain, txid, user_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS settings (

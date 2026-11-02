@@ -32,8 +32,11 @@ A fully automated Telegram shop for digital keys. It runs on any ordinary **cPan
 - Webhook secret verification, so only Telegram can talk to the bot
 - Every blockchain transaction can be used **only once**, so a TXID can't be replayed or claimed by two users
 - A TXID sent *before* a deposit was created can't be claimed for it
-- **Anti-theft:** if someone submits a TXID whose amount matches *another* customer's unique deposit amount, the money goes to that customer
-- TXID claims are auto-approved only when the amount is within $2 / 5% of the deposit and it was sent before the deposit expired. Anything else waits for **your approval** (Approve / Reject buttons in Telegram)
+- **A pasted TXID never credits money by itself.** It only helps the bot find the payment; blockchain rules decide who it belongs to
+- Exact unique amount → credited automatically to that deposit's owner
+- Slightly different amount (e.g. exchange fee) → credited automatically **only if exactly one** open deposit fits; otherwise the admin chooses
+- Unclear payments go to the admin with the **sender's wallet address**, the customer's **screenshot**, and ✅ Credit / ✏️ Other amount / ❌ Reject buttons
+- **Automatic account holds:** the same TXID submitted by two accounts → both frozen. Submitting a TXID that belongs to another customer's deposit → submitter frozen. Frozen accounts can't buy or deposit until you tap ✅ Release
 - At most 5 TXID attempts per user per hour
 - Each deposit is credited **exactly once**
 - Purchases run in a database transaction, so a key is never sold twice and balances can't go negative
@@ -76,7 +79,7 @@ The installer finds your Telegram ID automatically, writes the config, links the
 3. The **cron job** (every minute) or the user's **🔄 Check Payment** button scans your address on the blockchain. When a transfer with that exact amount arrives and is confirmed, the user's wallet is credited and they get a message.
 4. **If the user sent a different amount** (for example, their exchange deducted a withdrawal fee), they tap **🧾 Submit TXID** and paste the transaction hash. The bot checks that transaction on-chain and credits **what actually arrived**.
 5. Payments that match no deposit are reported to admins with an explorer link.
-6. Suspicious TXID claims (amount far from the deposit, or sent long after it expired) are held and sent to you with ✅ Approve / ❌ Reject buttons.
+6. Suspicious TXID claims are held and sent to you with the sender address, a screenshot from the customer and ✅ Credit / ✏️ Other amount / ❌ Reject buttons. Suspicious accounts are frozen automatically (Admin → ⏸ On Hold).
 
 Deposits expire after 60 minutes (configurable). A payment that arrives late is still credited.
 

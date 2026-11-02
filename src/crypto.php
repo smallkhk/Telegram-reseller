@@ -193,6 +193,9 @@ function create_crypto_deposit(array $user, string $chain, float $usd): array
         return ['ok' => false, 'error' => 'This network is not available.'];
     }
     $uid = (int)$user['id'];
+    if (!empty($user['is_held'])) {
+        return ['ok' => false, 'error' => 'Your account is on hold while an admin checks a payment.'];
+    }
     $open = (int)q("SELECT COUNT(*) FROM deposits WHERE user_id=? AND status='pending'", [$uid])->fetchColumn();
     if ($open >= 3) {
         return ['ok' => false, 'error' => 'You already have 3 unpaid deposits. Pay or cancel one of them first (Deposit → My pending deposits).'];
@@ -312,73 +315,92 @@ function find_exact_deposit(string $chain, array $t): ?array
     return null;
 }
 
+function claim_tolerance(float $requested): float
+{
+    return max((float)cfg('crypto.claim_tolerance_usd', 2), $requested * (float)cfg('crypto.claim_tolerance_pct', 5) / 100);
+}
+
 /**
- * Handle one incoming transfer to our address.
- * $t = ['txid','idx','amount','time','confirmed']
- * $claim = a deposit the user claims this TXID belongs to (or null for auto-matching).
- * Returns: credited | review | unconfirmed | used | unmatched | too_old | duplicate
+ * Open deposits a slightly-off payment could belong to (e.g. an exchange took a fee).
+ * Decided by the scanner from the blockchain data only, never by what a user claims.
  */
-function process_transfer(string $chain, array $t, ?array $claim = null): string
+function find_near_deposits(string $chain, array $t): array
+{
+    $cands = q(
+        "SELECT * FROM deposits WHERE chain=? AND status IN ('pending','expired') AND review=0 AND created_at > NOW() - INTERVAL 1 DAY",
+        [$chain]
+    )->fetchAll();
+    $out = [];
+    foreach ($cands as $d) {
+        if ($t['time'] < strtotime($d['created_at']) - 120 || $t['time'] > strtotime($d['expires_at']) + 1800) {
+            continue;
+        }
+        $req = (float)$d['amount'];
+        $val = deposit_value_usd($d, $t['amount']);
+        if (abs($val - $req) <= claim_tolerance($req)) {
+            $out[] = $d;
+        }
+    }
+    return $out;
+}
+
+/** Save a transfer we have seen. Returns [row, isNew]. */
+function record_tx(string $chain, array $t): array
+{
+    $ins = q(
+        'INSERT IGNORE INTO chain_txs (chain, txid, idx, amount, from_addr) VALUES (?,?,?,?,?)',
+        [$chain, $t['txid'], $t['idx'], $t['amount'], ($t['from'] ?? '') ?: null]
+    );
+    $row = q('SELECT * FROM chain_txs WHERE chain=? AND txid=? AND idx=?', [$chain, $t['txid'], $t['idx']])->fetch();
+    return [$row, $ins->rowCount() === 1];
+}
+
+/**
+ * Scanner: decide who an incoming transfer belongs to, using blockchain data only.
+ * Returns: credited | unconfirmed | used | unmatched | duplicate
+ */
+function process_transfer(string $chain, array $t): string
 {
     if (!$t['confirmed']) {
         return 'unconfirmed';
     }
-    $existing = q('SELECT * FROM chain_txs WHERE chain=? AND txid=? AND idx=?', [$chain, $t['txid'], $t['idx']])->fetch();
-    if ($existing && $existing['deposit_id']) {
+    [$row, $isNew] = record_tx($chain, $t);
+    if ($row['deposit_id']) {
         return 'used';
     }
 
-    if ($claim) {
-        // A tx sent before the deposit was created can't belong to it.
-        if ($t['time'] < strtotime($claim['created_at']) - 60) {
-            return 'too_old';
-        }
-        // Anti-theft: if the amount is exactly another customer's unique deposit amount,
-        // the money is theirs. Credit them, refuse the claimer.
-        $owner = find_exact_deposit($chain, $t);
-        if ($owner && (int)$owner['id'] !== (int)$claim['id']) {
-            process_transfer($chain, $t, null);
-            return 'used';
-        }
-        $exact = norm_dec((string)$claim['pay_amount']) === $t['amount'];
-        $credit = $exact ? (float)$claim['amount'] : deposit_value_usd($claim, $t['amount']);
+    // 1) Exact unique amount -> its deposit.
+    if ($dep = find_exact_deposit($chain, $t)) {
+        return reserve_and_credit($dep, $chain, $t['txid'], (int)$t['idx'], (float)$dep['amount']);
+    }
 
-        if (!$exact) {
-            // Only auto-approve amounts close to what this user asked to deposit,
-            // sent before the deposit expired. Everything else goes to the admin.
-            $req = (float)$claim['amount'];
-            $tol = max((float)cfg('crypto.claim_tolerance_usd', 2), $req * (float)cfg('crypto.claim_tolerance_pct', 5) / 100);
-            $late = $t['time'] > strtotime($claim['expires_at']) + 1800;
-            if (abs($credit - $req) > $tol || $late) {
-                if (!$existing) {
-                    q('INSERT IGNORE INTO chain_txs (chain, txid, idx, amount) VALUES (?,?,?,?)', [$chain, $t['txid'], $t['idx'], $t['amount']]);
-                }
-                request_claim_review($claim, $t, $credit, $late);
-                return 'review';
+    // 2) Slightly different amount and exactly ONE deposit fits -> credit what arrived.
+    $near = find_near_deposits($chain, $t);
+    if (count($near) === 1) {
+        return reserve_and_credit($near[0], $chain, $t['txid'], (int)$t['idx'], deposit_value_usd($near[0], $t['amount']));
+    }
+
+    // 3) Unclear -> tell the admin once (recent payments only).
+    if ($isNew && $t['time'] > time() - 6 * 3600) {
+        $info = chain_info($chain);
+        $text = '❓ <b>Unmatched payment</b>: <b>' . e($t['amount']) . ' ' . $info['coin'] . '</b> on ' . e($info['network'])
+            . (!empty($t['from']) ? "\n👛 From: <code>" . e($t['from']) . '</code>' : '')
+            . "\n🔗 <a href=\"" . e($info['explorer'] . $t['txid']) . '">View transaction</a>';
+        $rows = [];
+        if ($near) {
+            $text .= "\n\nIt could belong to one of these deposits. Credit only if you're sure:";
+            foreach (array_slice($near, 0, 5) as $d) {
+                $u = get_user((int)$d['user_id']);
+                $who = $u && $u['username'] ? '@' . $u['username'] : (string)$d['user_id'];
+                $val = deposit_value_usd($d, $t['amount']);
+                $rows[] = [btn("✅ #{$d['id']} {$who} • " . money($val), "a:tc:{$row['id']}:{$d['id']}")];
             }
+        } else {
+            $text .= "\n\nNo open deposit fits. If a customer submits this TXID you'll be asked to approve it, or credit them manually (Admin → Find User).";
         }
-        $target = $claim;
-    } else {
-        $target = find_exact_deposit($chain, $t);
-        $credit = $target ? (float)$target['amount'] : 0.0;
+        $rows ? notify_admins_kb($text, kb($rows)) : notify_admins($text);
     }
-
-    if (!$existing) {
-        q('INSERT IGNORE INTO chain_txs (chain, txid, idx, amount) VALUES (?,?,?,?)', [$chain, $t['txid'], $t['idx'], $t['amount']]);
-    }
-
-    if (!$target) {
-        // Unknown payment: tell admins once, if it is recent.
-        if (!$existing && $t['time'] > time() - 6 * 3600) {
-            $info = chain_info($chain);
-            notify_admins('❓ <b>Unmatched payment</b> received: <b>' . e($t['amount']) . ' ' . $info['coin'] . '</b> on ' . e($info['network'])
-                . "\n🔗 <a href=\"" . e($info['explorer'] . $t['txid']) . "\">View transaction</a>\n"
-                . 'The sender can claim it with <b>Submit TXID</b> on their deposit, or you can credit them manually (Admin → Find User).');
-        }
-        return 'unmatched';
-    }
-
-    return reserve_and_credit($target, $chain, $t['txid'], (int)$t['idx'], $credit);
+    return 'unmatched';
 }
 
 /** Atomically tie a transaction to a deposit and credit it. */
@@ -396,8 +418,133 @@ function reserve_and_credit(array $dep, string $chain, string $txid, int $idx, f
     return 'credited';
 }
 
-/** Put a suspicious TXID claim on hold and ask the admins to approve or reject it. */
-function request_claim_review(array $dep, array $t, float $credit, bool $late): void
+// ---------------------------------------------------------------------------
+// TXID claims (a user pastes a transaction hash) and account holds
+// ---------------------------------------------------------------------------
+
+/** Freeze accounts until an admin checks them. */
+function hold_users(array $uids, string $reason, string $details = ''): void
+{
+    $uids = array_values(array_unique(array_filter(array_map('intval', $uids), fn($u) => $u > 0 && !is_admin($u))));
+    $newlyHeld = [];
+    foreach ($uids as $u) {
+        $st = q('UPDATE users SET is_held=1, hold_reason=? WHERE id=? AND is_held=0', [mb_substr($reason, 0, 255), $u]);
+        if ($st->rowCount() === 1) {
+            $newlyHeld[] = $u;
+            send($u, "⏸ <b>Your account is on hold.</b>\n\nWe noticed something unusual with a payment and an admin will check it shortly. You can't buy or deposit until then.", kb([[btn('🆘 Contact Support', 'sup')]]));
+        }
+    }
+    if (!$newlyHeld) {
+        return;
+    }
+    $rows = [];
+    $list = '';
+    foreach ($newlyHeld as $u) {
+        $usr = get_user($u);
+        $name = $usr && $usr['username'] ? '@' . $usr['username'] : ($usr['first_name'] ?? (string)$u);
+        $list .= "\n• " . e($name) . " (<code>{$u}</code>) — balance " . money($usr['balance'] ?? 0);
+        $rows[] = [btn("✅ Release {$name}", "a:urel:{$u}"), btn("🚫 Ban {$name}", "a:uban:{$u}")];
+    }
+    notify_admins_kb("⏸ <b>Accounts put on hold</b>\n\n⚠️ " . e($reason) . ($details !== '' ? "\n" . $details : '') . "\n" . $list, kb($rows));
+}
+
+function lookup_tx(string $chain, string $txid): array
+{
+    if (isset($GLOBALS['__test_lookup_tx'])) { // automated tests only (cannot be set from the web)
+        return ($GLOBALS['__test_lookup_tx'])($chain, $txid);
+    }
+    switch ($chain) {
+        case 'trc20':
+            return trc20_tx($txid);
+        case 'bep20':
+            return bep20_tx($txid);
+        case 'btc':
+            return btc_tx($txid);
+    }
+    return [];
+}
+
+/**
+ * A user says this TXID paid their deposit. A claim alone NEVER credits money:
+ * it only helps the bot find the payment, then the normal blockchain rules decide.
+ * Returns ['status' => credited|review|held|unconfirmed|not_found|duplicate|too_old]
+ */
+function claim_txid(array $dep, string $txid): array
+{
+    $chain = $dep['chain'];
+    $uid = (int)$dep['user_id'];
+    $info = chain_info($chain);
+
+    // Remember who submitted what.
+    q('INSERT IGNORE INTO txid_claims (chain, txid, user_id, deposit_id) VALUES (?,?,?,?)', [$chain, $txid, $uid, $dep['id']]);
+
+    // Same TXID from several accounts -> hold all of them.
+    $others = q('SELECT DISTINCT user_id FROM txid_claims WHERE chain=? AND txid=? AND user_id<>?', [$chain, $txid, $uid])->fetchAll(PDO::FETCH_COLUMN);
+    if ($others) {
+        hold_users(array_merge([$uid], $others), 'The same TXID was submitted by more than one account.',
+            '🔗 <a href="' . e($info['explorer'] . $txid) . '">View transaction</a>');
+        return ['status' => 'held'];
+    }
+
+    try {
+        $transfers = lookup_tx($chain, $txid);
+    } catch (Throwable $e) {
+        log_error("claim_txid $chain $txid: " . $e->getMessage());
+        $transfers = [];
+    }
+    if (!$transfers) {
+        return ['status' => 'not_found'];
+    }
+
+    $status = 'not_found';
+    foreach ($transfers as $t) {
+        if (!$t['confirmed']) {
+            $status = 'unconfirmed';
+            continue;
+        }
+        if ($t['time'] < strtotime($dep['created_at']) - 120) {
+            $status = 'too_old';
+            continue;
+        }
+        [$row] = record_tx($chain, $t);
+
+        // Already credited?
+        if ($row['deposit_id']) {
+            $owner = q('SELECT * FROM deposits WHERE id=?', [$row['deposit_id']])->fetch();
+            if ($owner && (int)$owner['user_id'] === $uid) {
+                return ['status' => 'duplicate'];
+            }
+            hold_users([$uid], 'Submitted a TXID that already paid another customer\'s deposit #' . $row['deposit_id'] . '.',
+                '🔗 <a href="' . e($info['explorer'] . $txid) . '">View transaction</a>');
+            return ['status' => 'held'];
+        }
+
+        // Exact unique amount -> belongs to that deposit's owner.
+        if ($exact = find_exact_deposit($chain, $t)) {
+            $r = reserve_and_credit($exact, $chain, $t['txid'], (int)$t['idx'], (float)$exact['amount']);
+            if ((int)$exact['user_id'] === $uid) {
+                return ['status' => $r];
+            }
+            hold_users([$uid], 'Submitted another customer\'s payment as their own (it matched deposit #' . $exact['id'] . ' exactly).',
+                '🔗 <a href="' . e($info['explorer'] . $txid) . '">View transaction</a>');
+            return ['status' => 'held'];
+        }
+
+        // Slightly different amount and this deposit is the ONLY one that fits -> safe to credit.
+        $near = find_near_deposits($chain, $t);
+        if (count($near) === 1 && (int)$near[0]['id'] === (int)$dep['id']) {
+            return ['status' => reserve_and_credit($dep, $chain, $t['txid'], (int)$t['idx'], deposit_value_usd($dep, $t['amount']))];
+        }
+
+        // Anything else -> the admin decides, with the customer's screenshot.
+        request_claim_review($dep, $t, $row);
+        return ['status' => 'review'];
+    }
+    return ['status' => $status];
+}
+
+/** Put a TXID claim on hold and ask the admins to decide. */
+function request_claim_review(array $dep, array $t, array $row): void
 {
     $st = q(
         "UPDATE deposits SET review=1, claim_txid=?, review_idx=? WHERE id=? AND review=0 AND status IN ('pending','expired')",
@@ -409,29 +556,37 @@ function request_claim_review(array $dep, array $t, float $credit, bool $late): 
     $info = chain_info($dep['chain']);
     $u = get_user((int)$dep['user_id']);
     $who = $u && $u['username'] ? '@' . e($u['username']) : e($u['first_name'] ?? '');
+    $credit = floor_cents(deposit_value_usd($dep, $t['amount']));
     $reasons = [];
-    if (abs($credit - (float)$dep['amount']) > 0.009) {
-        $reasons[] = 'amount differs from the deposit (asked ' . money($dep['amount']) . ', received ≈ ' . money($credit) . ')';
+    if (abs($credit - (float)$dep['amount']) > claim_tolerance((float)$dep['amount'])) {
+        $reasons[] = 'amount is far from the deposit';
     }
-    if ($late) {
-        $reasons[] = 'sent after the deposit expired';
+    if ($t['time'] > strtotime($dep['expires_at']) + 1800) {
+        $reasons[] = 'sent long after the deposit expired';
+    }
+    if (!$reasons) {
+        $reasons[] = 'more than one deposit could own this payment';
     }
     notify_admins_kb(
-        "🕵️ <b>TXID claim needs your approval</b>\n\n"
+        "🕵️ <b>Payment needs your approval</b>\n\n"
         . "🧾 Deposit #{$dep['id']} by {$who} (<code>{$dep['user_id']}</code>)\n"
         . '💵 Asked: <b>' . money($dep['amount']) . "</b>\n"
         . '📥 Received: <b>' . e($t['amount']) . ' ' . $info['coin'] . '</b> ≈ <b>' . money($credit) . "</b>\n"
+        . (!empty($row['from_addr']) ? '👛 From: <code>' . e($row['from_addr']) . "</code>\n" : '')
         . '🕐 Deposit created: ' . e($dep['created_at']) . "\n"
         . '🕐 Payment sent: ' . date('Y-m-d H:i:s', $t['time']) . "\n"
         . '⚠️ Why: ' . e(implode('; ', $reasons)) . "\n\n"
         . "🔗 <a href=\"" . e($info['explorer'] . $t['txid']) . "\">Check the transaction</a>\n\n"
-        . '<i>Approve only if you are sure this customer sent it (e.g. they showed you a screenshot from their wallet/exchange).</i>',
-        kb([[btn('✅ Approve ' . money($credit), 'a:dpa:' . $dep['id']), btn('❌ Reject', 'a:dpr:' . $dep['id'])]])
+        . "<i>The customer has been asked to send a screenshot of their withdrawal; it will appear here.</i>",
+        kb([
+            [btn('✅ Credit ' . money($credit), 'a:dpa:' . $dep['id'])],
+            [btn('✏️ Credit other amount', 'a:dpe:' . $dep['id']), btn('❌ Reject', 'a:dpr:' . $dep['id'])],
+        ])
     );
 }
 
-/** Admin approved a claim under review. */
-function approve_claim(int $depId): string
+/** Admin approved a claim under review (optionally with a custom amount). */
+function approve_claim(int $depId, ?float $amount = null): string
 {
     $dep = q("SELECT * FROM deposits WHERE id=? AND review=1 AND status IN ('pending','expired')", [$depId])->fetch();
     if (!$dep) {
@@ -441,7 +596,20 @@ function approve_claim(int $depId): string
     if (!$tx) {
         return 'gone';
     }
-    return reserve_and_credit($dep, $dep['chain'], $tx['txid'], (int)$tx['idx'], deposit_value_usd($dep, (string)$tx['amount']));
+    $credit = $amount ?? deposit_value_usd($dep, (string)$tx['amount']);
+    return reserve_and_credit($dep, $dep['chain'], $tx['txid'], (int)$tx['idx'], $credit);
+}
+
+/** Admin credits an unmatched payment to a chosen deposit. */
+function admin_credit_tx(int $txRowId, int $depId, ?float $amount = null): string
+{
+    $tx = q('SELECT * FROM chain_txs WHERE id=?', [$txRowId])->fetch();
+    $dep = q("SELECT * FROM deposits WHERE id=? AND status IN ('pending','expired')", [$depId])->fetch();
+    if (!$tx || !$dep || $tx['chain'] !== $dep['chain']) {
+        return 'gone';
+    }
+    $credit = $amount ?? deposit_value_usd($dep, (string)$tx['amount']);
+    return reserve_and_credit($dep, $tx['chain'], $tx['txid'], (int)$tx['idx'], $credit);
 }
 
 function reject_claim(int $depId): bool
@@ -451,7 +619,7 @@ function reject_claim(int $depId): bool
         return false;
     }
     q('UPDATE deposits SET review=0, claim_txid=NULL, review_idx=NULL WHERE id=?', [$depId]);
-    send($dep['user_id'], "❌ Your TXID for deposit #{$depId} was not approved. If you think this is a mistake, please contact support with proof of payment.", kb([[btn('🆘 Support', 'sup')]]));
+    send($dep['user_id'], "❌ Your payment claim for deposit #{$depId} was not approved. If you think this is a mistake, please contact support with proof of payment.", kb([[btn('🆘 Support', 'sup')]]));
     return true;
 }
 
@@ -498,44 +666,6 @@ function fetch_incoming(string $chain): array
     return [];
 }
 
-/**
- * Verify a TXID the user submitted for a deposit.
- * Returns ['status' => credited|unconfirmed|not_found|used|too_old|duplicate|wrong]
- */
-function verify_txid(array $dep, string $txid): array
-{
-    $chain = $dep['chain'];
-    try {
-        switch ($chain) {
-            case 'trc20':
-                $transfers = trc20_tx($txid);
-                break;
-            case 'bep20':
-                $transfers = bep20_tx($txid);
-                break;
-            case 'btc':
-                $transfers = btc_tx($txid);
-                break;
-            default:
-                $transfers = [];
-        }
-    } catch (Throwable $e) {
-        log_error("verify_txid $chain $txid: " . $e->getMessage());
-        return ['status' => 'not_found'];
-    }
-    if (!$transfers) {
-        return ['status' => 'not_found'];
-    }
-    $last = 'not_found';
-    foreach ($transfers as $t) {
-        $last = process_transfer($chain, $t, $dep);
-        if ($last === 'credited') {
-            break;
-        }
-    }
-    return ['status' => $last];
-}
-
 // ---- TRON (USDT TRC20) via TronGrid ----------------------------------------
 
 function trongrid_headers(): array
@@ -570,6 +700,7 @@ function trc20_incoming(): array
             'txid' => strtolower($tx['transaction_id']),
             'idx' => 0,
             'amount' => units_to_dec((string)$tx['value'], (int)($tx['token_info']['decimals'] ?? 6)),
+            'from' => (string)($tx['from'] ?? ''),
             'time' => (int)floor(($tx['block_timestamp'] ?? time() * 1000) / 1000),
             'confirmed' => true,
         ];
@@ -603,6 +734,35 @@ function tron_addr_hex(string $addr): string
     return substr($hex, 2, 40);
 }
 
+/** 20-byte hex -> TRON base58 address (T...). */
+function tron_hex_to_addr(string $hex20): string
+{
+    if (!preg_match('/^[0-9a-fA-F]{40}$/', $hex20)) {
+        return '';
+    }
+    $bin = hex2bin('41' . $hex20);
+    $bin .= substr(hash('sha256', hash('sha256', $bin, true), true), 0, 4);
+    $alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+    $digits = [0];
+    foreach (unpack('C*', $bin) as $byte) {
+        $carry = $byte;
+        foreach ($digits as $i => $d) {
+            $v = $d * 256 + $carry;
+            $digits[$i] = $v % 58;
+            $carry = intdiv($v, 58);
+        }
+        while ($carry > 0) {
+            $digits[] = $carry % 58;
+            $carry = intdiv($carry, 58);
+        }
+    }
+    $out = '';
+    foreach (array_reverse($digits) as $d) {
+        $out .= $alphabet[$d];
+    }
+    return $out;
+}
+
 /** Look up one TRON transaction and return USDT transfers to our address. */
 function trc20_tx(string $txid): array
 {
@@ -629,6 +789,7 @@ function trc20_tx(string $txid): array
                 'txid' => strtolower($txid),
                 'idx' => 0,
                 'amount' => units_to_dec(hex_to_dec($log['data']), 6),
+                'from' => tron_hex_to_addr(substr((string)($log['topics'][1] ?? ''), -40)),
                 'time' => (int)floor(($info['blockTimeStamp'] ?? time() * 1000) / 1000),
                 'confirmed' => $confirmed,
             ];
@@ -673,6 +834,7 @@ function bsc_log_to_transfer(array $log, bool $confirmed): array
         'txid' => strtolower($log['transactionHash']),
         'idx' => (int)hexdec($log['logIndex']),
         'amount' => units_to_dec(hex_to_dec($log['data']), 18),
+        'from' => '0x' . substr(strtolower((string)($log['topics'][1] ?? '')), -40),
         'time' => $time,
         'confirmed' => $confirmed,
     ];
@@ -773,6 +935,7 @@ function btc_tx_to_transfer(array $tx, int $tip): ?array
         'txid' => strtolower($tx['txid']),
         'idx' => 0,
         'amount' => units_to_dec((string)$sats, 8),
+        'from' => (string)($tx['vin'][0]['prevout']['scriptpubkey_address'] ?? ''),
         'time' => (int)($tx['status']['block_time'] ?? time()),
         'confirmed' => $isConf,
     ];
@@ -827,11 +990,12 @@ function run_deposit_checks(): array
 
     // Re-check TXIDs that users submitted but were not final yet.
     $claims = q(
-        "SELECT * FROM deposits WHERE claim_txid IS NOT NULL AND review=0 AND status IN ('pending','expired') AND created_at > NOW() - INTERVAL 1 DAY"
+        "SELECT d.* FROM deposits d JOIN users u ON u.id=d.user_id
+         WHERE u.is_held=0 AND d.claim_txid IS NOT NULL AND d.review=0 AND d.status IN ('pending','expired') AND d.created_at > NOW() - INTERVAL 1 DAY"
     )->fetchAll();
     foreach ($claims as $d) {
-        $r = verify_txid($d, $d['claim_txid']);
-        if (in_array($r['status'], ['used', 'too_old', 'duplicate'], true)) {
+        $r = claim_txid($d, $d['claim_txid']);
+        if (in_array($r['status'], ['too_old', 'duplicate', 'held'], true)) {
             q('UPDATE deposits SET claim_txid=NULL WHERE id=?', [$d['id']]);
             send($d['user_id'], "❌ The TXID you submitted for deposit #{$d['id']} could not be accepted (" . txid_status_text($r['status']) . ').');
         }
@@ -866,6 +1030,7 @@ function txid_status_text(string $status): string
     return [
         'credited' => 'credited',
         'review' => 'sent to the admin for a quick manual check',
+        'held' => 'your account was put on hold for an admin check',
         'unconfirmed' => 'waiting for confirmations',
         'not_found' => 'no payment to our address found in this transaction yet',
         'used' => 'this transaction is already used by another deposit',
