@@ -145,7 +145,7 @@ function finish_request(): void
 /**
  * Upgrade the database of an existing shop automatically (adds new columns once).
  */
-function migrate_schema(): void
+function migrate_schema(bool $force = false): void
 {
     $target = 3;
     try {
@@ -153,7 +153,7 @@ function migrate_schema(): void
     } catch (Throwable $e) {
         return; // tables not created yet
     }
-    if ($v >= $target) {
+    if ($v >= $target && !$force) {
         return;
     }
     $alters = [
@@ -202,4 +202,26 @@ function rate_limit(string $key, int $max, int $windowSeconds): bool
     }
     q('INSERT INTO settings (k, v) VALUES (?,?) ON DUPLICATE KEY UPDATE v=VALUES(v)', [$k, $start . '|' . ($count + 1)]);
     return true;
+}
+
+/** True for "unknown column / missing table" database errors (fixable by migrate_schema). */
+function is_schema_error(Throwable $e): bool
+{
+    $m = $e->getMessage();
+    return $e instanceof PDOException
+        && (str_contains($m, '42S22') || str_contains($m, '42S02') || stripos($m, 'Unknown column') !== false || stripos($m, "doesn't exist") !== false);
+}
+
+/** Tell admins about an unexpected error (at most once every 10 minutes). */
+function report_error_to_admins(Throwable $e): void
+{
+    try {
+        $last = (int)(q("SELECT v FROM settings WHERE k='last_error_alert'")->fetchColumn() ?: 0);
+        if (time() - $last < 600) {
+            return;
+        }
+        q("INSERT INTO settings (k, v) VALUES ('last_error_alert', ?) ON DUPLICATE KEY UPDATE v=VALUES(v)", [time()]);
+        notify_admins("⚠️ <b>Bot error</b> (the bot kept running):\n<code>" . e(mb_substr($e->getMessage(), 0, 300)) . "</code>\n\nIf this keeps happening, send this message to your developer.");
+    } catch (Throwable $ignored) {
+    }
 }
