@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS users (
     state_data VARCHAR(255) NULL,
     buy_token VARCHAR(16) NULL,
     is_banned TINYINT(1) NOT NULL DEFAULT 0,
+    is_reseller TINYINT(1) NOT NULL DEFAULT 0,
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_username (username)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -25,6 +26,7 @@ CREATE TABLE IF NOT EXISTS products (
     name VARCHAR(150) NOT NULL,
     description TEXT NULL,
     price DECIMAL(14,2) NOT NULL,
+    reseller_price DECIMAL(14,2) NULL,
     active TINYINT(1) NOT NULL DEFAULT 1,
     deleted TINYINT(1) NOT NULL DEFAULT 0,
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -66,6 +68,8 @@ CREATE TABLE IF NOT EXISTS deposits (
     status ENUM('pending','paid','expired','cancelled') NOT NULL DEFAULT 'pending',
     txid VARCHAR(100) NULL,
     claim_txid VARCHAR(100) NULL,
+    review TINYINT(1) NOT NULL DEFAULT 0,
+    review_idx INT NULL,
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     expires_at DATETIME NOT NULL,
     paid_at DATETIME NULL,

@@ -141,3 +141,52 @@ function finish_request(): void
     }
     flush();
 }
+
+/**
+ * Upgrade the database of an existing shop automatically (adds new columns once).
+ */
+function migrate_schema(): void
+{
+    $target = 2;
+    try {
+        $v = (int)(q("SELECT v FROM settings WHERE k='schema_version'")->fetchColumn() ?: 1);
+    } catch (Throwable $e) {
+        return; // tables not created yet
+    }
+    if ($v >= $target) {
+        return;
+    }
+    $alters = [
+        'ALTER TABLE users ADD COLUMN is_reseller TINYINT(1) NOT NULL DEFAULT 0',
+        'ALTER TABLE products ADD COLUMN reseller_price DECIMAL(14,2) NULL',
+        'ALTER TABLE deposits ADD COLUMN review TINYINT(1) NOT NULL DEFAULT 0',
+        'ALTER TABLE deposits ADD COLUMN review_idx INT NULL',
+    ];
+    foreach ($alters as $sql) {
+        try {
+            db()->exec($sql);
+        } catch (PDOException $e) {
+            if (stripos($e->getMessage(), 'Duplicate column') === false) {
+                throw $e;
+            }
+        }
+    }
+    q("INSERT INTO settings (k, v) VALUES ('schema_version', ?) ON DUPLICATE KEY UPDATE v=VALUES(v)", [$target]);
+}
+
+/** Simple per-key rate limit stored in the settings table. Returns false when over the limit. */
+function rate_limit(string $key, int $max, int $windowSeconds): bool
+{
+    $k = 'rl_' . $key;
+    $raw = (string)(q('SELECT v FROM settings WHERE k=?', [$k])->fetchColumn() ?: '');
+    [$start, $count] = array_map('intval', array_pad(explode('|', $raw), 2, 0));
+    if (time() - $start > $windowSeconds) {
+        $start = time();
+        $count = 0;
+    }
+    if ($count >= $max) {
+        return false;
+    }
+    q('INSERT INTO settings (k, v) VALUES (?,?) ON DUPLICATE KEY UPDATE v=VALUES(v)', [$k, $start . '|' . ($count + 1)]);
+    return true;
+}

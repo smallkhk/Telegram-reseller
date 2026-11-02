@@ -21,7 +21,9 @@ A fully automated Telegram shop for digital keys. It runs on any ordinary **cPan
 - Add, rename, hide or delete categories and products
 - Bulk-add keys by pasting them one per line **or uploading a .txt file** (duplicates skipped)
 - Change prices and descriptions
-- Find a user by ID or @username: add or deduct balance, ban or unban
+- Find a user by ID or @username: add or deduct balance, ban or unban, **⭐ make them a reseller**
+- **Reseller pricing:** every product has a customer price and an optional cheaper ⭐ reseller price. Resellers automatically see and pay their price.
+- **🕵️ TXID Reviews:** approve or reject suspicious payment claims with one tap
 - Recent deposits and orders
 - Broadcast a message (text, photo, video…) to all users
 - DM alerts for every sale, every deposit and every product that runs out of stock
@@ -30,6 +32,9 @@ A fully automated Telegram shop for digital keys. It runs on any ordinary **cPan
 - Webhook secret verification, so only Telegram can talk to the bot
 - Every blockchain transaction can be used **only once**, so a TXID can't be replayed or claimed by two users
 - A TXID sent *before* a deposit was created can't be claimed for it
+- **Anti-theft:** if someone submits a TXID whose amount matches *another* customer's unique deposit amount, the money goes to that customer
+- TXID claims are auto-approved only when the amount is within $2 / 5% of the deposit and it was sent before the deposit expired. Anything else waits for **your approval** (Approve / Reject buttons in Telegram)
+- At most 5 TXID attempts per user per hour
 - Each deposit is credited **exactly once**
 - Purchases run in a database transaction, so a key is never sold twice and balances can't go negative
 - One-time confirm tokens, so double-tapping "Confirm" can't buy twice
@@ -71,6 +76,7 @@ The installer finds your Telegram ID automatically, writes the config, links the
 3. The **cron job** (every minute) or the user's **🔄 Check Payment** button scans your address on the blockchain. When a transfer with that exact amount arrives and is confirmed, the user's wallet is credited and they get a message.
 4. **If the user sent a different amount** (for example, their exchange deducted a withdrawal fee), they tap **🧾 Submit TXID** and paste the transaction hash. The bot checks that transaction on-chain and credits **what actually arrived**.
 5. Payments that match no deposit are reported to admins with an explorer link.
+6. Suspicious TXID claims (amount far from the deposit, or sent long after it expired) are held and sent to you with ✅ Approve / ❌ Reject buttons.
 
 Deposits expire after 60 minutes (configurable). A payment that arrives late is still credited.
 
@@ -133,6 +139,9 @@ bot/
 | Broadcast stops early on a large user list | Some hosts kill long scripts. Ask the host to raise `max_execution_time`, or broadcast in smaller batches. |
 | 500 error | Usually PHP < 8.0. Select PHP 8.x in cPanel → **MultiPHP Manager**. |
 
+**Updating an existing shop:** upload the new ZIP over the old files and click Extract → overwrite. Your `config.php` isn't in the ZIP, so your settings are kept. The database upgrades itself automatically.
+
 **Admin tips:**
+- To make a reseller: the person starts your bot → `/admin` → **Find User** → send their @username → **⭐ Make Reseller**. Then set **⭐ Reseller Price** on each product.
 - Users can type `/cancel` to stop any text input.
 - Only sell keys you have the right to resell.

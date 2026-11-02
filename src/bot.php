@@ -159,11 +159,11 @@ function handle_callback(array $cq): void
                 edit($chatId, $msgId, $t, $k);
                 break;
             case 'cat':
-                [$t, $k] = category_view((int)($p[1] ?? 0));
+                [$t, $k] = category_view((int)($p[1] ?? 0), $user);
                 edit($chatId, $msgId, $t, $k);
                 break;
             case 'p':
-                [$t, $k] = product_view((int)($p[1] ?? 0));
+                [$t, $k] = product_view((int)($p[1] ?? 0), $user);
                 edit($chatId, $msgId, $t, $k);
                 break;
             case 'b':
@@ -269,6 +269,7 @@ function main_view(array $user): array
         . '💰 Balance: <b>' . money($user['balance']) . "</b>\n"
         . '📦 Orders: <b>' . (int)$stats['n'] . "</b>\n"
         . '💸 Total spent: <b>' . money($stats['spent']) . "</b>\n"
+        . '👤 Account: <b>' . (is_reseller($user) ? '⭐ Reseller (special prices)' : 'Customer') . "</b>\n"
         . "🆔 Your ID: <code>{$uid}</code>\n"
         . "━━━━━━━━━━━━━━━\n"
         . 'Choose an option below 👇';
@@ -304,19 +305,33 @@ function shop_view(): array
     return ["🛒 <b>Shop</b>\n\nChoose a category:", kb($rows)];
 }
 
+function is_reseller(array $user): bool
+{
+    return !empty($user['is_reseller']);
+}
+
+/** The price this user pays for a product. */
+function price_for(array $user, array $p): float
+{
+    if (is_reseller($user) && $p['reseller_price'] !== null && $p['reseller_price'] !== '') {
+        return (float)$p['reseller_price'];
+    }
+    return (float)$p['price'];
+}
+
 function product_stock(int $pid): int
 {
     return (int)q("SELECT COUNT(*) FROM product_keys WHERE product_id=? AND status='available'", [$pid])->fetchColumn();
 }
 
-function category_view(int $cid): array
+function category_view(int $cid, array $user): array
 {
     $cat = q('SELECT * FROM categories WHERE id=? AND active=1', [$cid])->fetch();
     if (!$cat) {
         return shop_view();
     }
     $prods = q(
-        "SELECT p.id, p.name, p.price,
+        "SELECT p.id, p.name, p.price, p.reseller_price,
                 (SELECT COUNT(*) FROM product_keys k WHERE k.product_id=p.id AND k.status='available') AS stock
          FROM products p WHERE p.category_id=? AND p.active=1 AND p.deleted=0 ORDER BY p.name",
         [$cid]
@@ -325,15 +340,16 @@ function category_view(int $cid): array
     $rows = [];
     foreach ($prods as $p) {
         $stock = (int)$p['stock'];
-        $label = $p['name'] . ' • ' . money($p['price']) . ($stock > 0 ? " • {$stock} left" : ' • ❌ Sold out');
+        $label = $p['name'] . ' • ' . money(price_for($user, $p)) . ($stock > 0 ? " • {$stock} left" : ' • ❌ Sold out');
         $rows[] = [btn($label, 'p:' . $p['id'])];
     }
     $rows[] = [btn('⬅️ Back', 'shop'), btn('🏠 Dashboard', 'home')];
-    $text = '📁 <b>' . e($cat['name']) . "</b>\n\n" . ($prods ? 'Choose a product:' : 'No products in this category yet.');
+    $text = '📁 <b>' . e($cat['name']) . "</b>\n\n" . ($prods ? 'Choose a product:' : 'No products in this category yet.')
+        . (is_reseller($user) && $prods ? "\n\n⭐ <i>You see reseller prices.</i>" : '');
     return [$text, kb($rows)];
 }
 
-function product_view(int $pid): array
+function product_view(int $pid, array $user): array
 {
     $p = q('SELECT * FROM products WHERE id=? AND active=1 AND deleted=0', [$pid])->fetch();
     if (!$p) {
@@ -342,7 +358,8 @@ function product_view(int $pid): array
     $stock = product_stock($pid);
     $text = '📦 <b>' . e($p['name']) . "</b>\n\n"
         . ($p['description'] ? e($p['description']) . "\n\n" : '')
-        . '💵 Price: <b>' . money($p['price']) . "</b>\n"
+        . '💵 Price: <b>' . money(price_for($user, $p)) . '</b>'
+        . (price_for($user, $p) < (float)$p['price'] ? ' ⭐ <i>reseller price</i> (normal <s>' . money($p['price']) . '</s>)' : '') . "\n"
         . '📊 In stock: <b>' . $stock . "</b>\n\n"
         . ($stock > 0 ? 'Select quantity to buy:' : '❌ <b>Sold out.</b> Please check back later.');
 
@@ -368,7 +385,7 @@ function confirm_view(array $user, int $pid, int $qty): array
     if ($stock < $qty) {
         return ["❌ Only <b>{$stock}</b> left in stock.", kb([[btn('⬅️ Back', 'p:' . $pid)]])];
     }
-    $total = round((float)$p['price'] * $qty, 2);
+    $total = round(price_for($user, $p) * $qty, 2);
     $bal = (float)$user['balance'];
 
     $text = "🧾 <b>Confirm your order</b>\n\n"
@@ -491,7 +508,7 @@ function deposit_invoice_view(int $uid, int $depId, string $note = ''): array
         . "\n⚠️ Send <b>only {$info['coin']} on {$info['network']}</b>. Other coins/networks will be lost.\n"
         . "⚠️ The exact decimals identify your payment. If your exchange deducts a fee, use <b>Submit TXID</b> after sending.\n\n"
         . '✅ Your wallet is credited automatically after network confirmation.'
-        . ($dep['claim_txid'] ? "\n\n🔎 TXID submitted — checking: <code>" . e(substr($dep['claim_txid'], 0, 20)) . '…</code>' : '')
+        . ($dep['review'] ? "\n\n🕵️ <b>Waiting for admin approval</b> of your TXID." : ($dep['claim_txid'] ? "\n\n🔎 TXID submitted — checking: <code>" . e(substr($dep['claim_txid'], 0, 20)) . '…</code>' : ''))
         . ($note !== '' ? "\n\n" . $note : '');
 
     return [$text, kb([
@@ -525,7 +542,7 @@ function check_deposit(array $user, int $chatId, ?int $msgId, int $depId): void
     }
     if (in_array($dep['status'], ['pending', 'expired'], true)) {
         scan_chain($dep['chain']);
-        if ($dep['claim_txid']) {
+        if ($dep['claim_txid'] && !$dep['review']) {
             verify_txid($dep, $dep['claim_txid']);
         }
         $dep = q('SELECT * FROM deposits WHERE id=?', [$depId])->fetch();
@@ -534,6 +551,8 @@ function check_deposit(array $user, int $chatId, ?int $msgId, int $depId): void
         toast('✅ Payment confirmed! Your wallet has been credited.', true);
     } elseif ($dep['status'] === 'cancelled') {
         toast('This deposit was cancelled.', true);
+    } elseif ($dep['review']) {
+        toast('🕵️ Your payment is waiting for admin approval. You will get a message.', true);
     } else {
         toast("⏳ Payment not detected yet.\n\nBlockchain confirmations can take a few minutes (BTC: 10–30 min). You'll get a message as soon as it arrives.", true);
     }
@@ -548,6 +567,11 @@ function submit_txid(array $user, int $chatId, int $depId, string $text): void
     if (!$dep) {
         set_state($uid, null);
         send($chatId, 'This deposit is no longer open.', kb([[btn('💳 Deposit', 'dep')]]));
+        return;
+    }
+    if (!rate_limit('txid_' . $uid, 5, 3600)) {
+        set_state($uid, null);
+        send($chatId, '⏳ Too many TXID attempts. Please wait an hour or contact support.', kb([[btn('🆘 Support', 'sup')]]));
         return;
     }
     $txid = normalize_txid($dep['chain'], $text);
@@ -569,6 +593,10 @@ function submit_txid(array $user, int $chatId, int $depId, string $text): void
     switch ($r['status']) {
         case 'credited':
             return; // credit_deposit() already messaged the user
+        case 'review':
+            [$t, $k] = deposit_invoice_view($uid, $depId, "🕵️ <b>Payment found.</b> Because the amount or time doesn't match this deposit exactly, the admin will confirm it shortly. You'll get a message here.");
+            send($chatId, $t, $k);
+            return;
         case 'unconfirmed':
         case 'not_found':
             q('UPDATE deposits SET claim_txid=? WHERE id=?', [$txid, $depId]);
@@ -671,7 +699,9 @@ function purchase(int $uid, int $pid, int $qty): array
         if (count($keys) < $qty) {
             throw new RuntimeException('Not enough stock. Only ' . count($keys) . ' left.');
         }
-        $total = dec((float)$prod['price'] * $qty);
+        $buyer = q('SELECT * FROM users WHERE id=?', [$uid])->fetch();
+        $unit = price_for($buyer ?: [], $prod);
+        $total = dec($unit * $qty);
 
         $st = q('UPDATE users SET balance = balance - ? WHERE id=? AND balance >= ?', [$total, $uid, $total]);
         if ($st->rowCount() !== 1) {
@@ -680,7 +710,7 @@ function purchase(int $uid, int $pid, int $qty): array
 
         q(
             'INSERT INTO orders (user_id, product_id, product_name, quantity, unit_price, total) VALUES (?,?,?,?,?,?)',
-            [$uid, $pid, $prod['name'], $qty, $prod['price'], $total]
+            [$uid, $pid, $prod['name'], $qty, dec($unit), $total]
         );
         $oid = (int)$pdo->lastInsertId();
 
@@ -750,7 +780,7 @@ function do_purchase(array $user, int $chatId, ?int $msgId, int $pid, int $qty, 
     $left = product_stock($pid);
     if (cfg('notify_admin_sales')) {
         $uname = $user['username'] ? '@' . e($user['username']) : e($user['first_name']);
-        notify_admins("🛒 Sale #{$r['order_id']}: " . e($r['product']) . " ×{$r['qty']} — <b>" . money($r['total']) . "</b> by {$uname} (<code>{$uid}</code>)\n📊 Stock left: <b>{$left}</b>");
+        notify_admins("🛒 Sale #{$r['order_id']}: " . e($r['product']) . " ×{$r['qty']} — <b>" . money($r['total']) . "</b> by {$uname} (<code>{$uid}</code>)" . (is_reseller($user) ? ' ⭐ reseller' : '') . "\n📊 Stock left: <b>{$left}</b>");
     } elseif ($left === 0) {
         notify_admins('⚠️ <b>' . e($r['product']) . '</b> is now out of stock.');
     }

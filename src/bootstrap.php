@@ -19,3 +19,9 @@ require __DIR__ . '/bot.php';
 require __DIR__ . '/admin.php';
 
 date_default_timezone_set((string)cfg('timezone', 'UTC'));
+
+try {
+    migrate_schema();
+} catch (Throwable $e) {
+    log_error('Migration failed: ' . $e->getMessage());
+}

@@ -297,6 +297,27 @@ function deposit_value_usd(array $dep, string $amount): float
  * $claim = a deposit the user claims this TXID belongs to (or null for auto-matching).
  * Returns: credited | unconfirmed | used | unmatched | too_old | duplicate
  */
+/** Open deposit whose unique amount equals this transfer exactly (the automatic match). */
+function find_exact_deposit(string $chain, array $t): ?array
+{
+    $cands = q(
+        "SELECT * FROM deposits WHERE chain=? AND status IN ('pending','expired') AND created_at > NOW() - INTERVAL 1 DAY ORDER BY id DESC",
+        [$chain]
+    )->fetchAll();
+    foreach ($cands as $d) {
+        if (norm_dec((string)$d['pay_amount']) === $t['amount'] && $t['time'] >= strtotime($d['created_at']) - 120) {
+            return $d;
+        }
+    }
+    return null;
+}
+
+/**
+ * Handle one incoming transfer to our address.
+ * $t = ['txid','idx','amount','time','confirmed']
+ * $claim = a deposit the user claims this TXID belongs to (or null for auto-matching).
+ * Returns: credited | review | unconfirmed | used | unmatched | too_old | duplicate
+ */
 function process_transfer(string $chain, array $t, ?array $claim = null): string
 {
     if (!$t['confirmed']) {
@@ -308,27 +329,37 @@ function process_transfer(string $chain, array $t, ?array $claim = null): string
     }
 
     if ($claim) {
-        // A tx sent long before the deposit was created can't belong to it.
-        if ($t['time'] < strtotime($claim['created_at']) - 600) {
+        // A tx sent before the deposit was created can't belong to it.
+        if ($t['time'] < strtotime($claim['created_at']) - 60) {
             return 'too_old';
         }
-        $target = $claim;
-        // Exact unique amount -> credit the requested amount; otherwise credit what actually arrived.
-        $credit = norm_dec((string)$claim['pay_amount']) === $t['amount']
-            ? (float)$claim['amount']
-            : deposit_value_usd($claim, $t['amount']);
-    } else {
-        $target = null;
-        $cands = q(
-            "SELECT * FROM deposits WHERE chain=? AND status IN ('pending','expired') AND created_at > NOW() - INTERVAL 1 DAY ORDER BY id DESC",
-            [$chain]
-        )->fetchAll();
-        foreach ($cands as $d) {
-            if (norm_dec((string)$d['pay_amount']) === $t['amount'] && $t['time'] >= strtotime($d['created_at']) - 120) {
-                $target = $d;
-                break;
+        // Anti-theft: if the amount is exactly another customer's unique deposit amount,
+        // the money is theirs. Credit them, refuse the claimer.
+        $owner = find_exact_deposit($chain, $t);
+        if ($owner && (int)$owner['id'] !== (int)$claim['id']) {
+            process_transfer($chain, $t, null);
+            return 'used';
+        }
+        $exact = norm_dec((string)$claim['pay_amount']) === $t['amount'];
+        $credit = $exact ? (float)$claim['amount'] : deposit_value_usd($claim, $t['amount']);
+
+        if (!$exact) {
+            // Only auto-approve amounts close to what this user asked to deposit,
+            // sent before the deposit expired. Everything else goes to the admin.
+            $req = (float)$claim['amount'];
+            $tol = max((float)cfg('crypto.claim_tolerance_usd', 2), $req * (float)cfg('crypto.claim_tolerance_pct', 5) / 100);
+            $late = $t['time'] > strtotime($claim['expires_at']) + 1800;
+            if (abs($credit - $req) > $tol || $late) {
+                if (!$existing) {
+                    q('INSERT IGNORE INTO chain_txs (chain, txid, idx, amount) VALUES (?,?,?,?)', [$chain, $t['txid'], $t['idx'], $t['amount']]);
+                }
+                request_claim_review($claim, $t, $credit, $late);
+                return 'review';
             }
         }
+        $target = $claim;
+    } else {
+        $target = find_exact_deposit($chain, $t);
         $credit = $target ? (float)$target['amount'] : 0.0;
     }
 
@@ -347,16 +378,81 @@ function process_transfer(string $chain, array $t, ?array $claim = null): string
         return 'unmatched';
     }
 
-    // Reserve the tx for this deposit (atomic: only one deposit can take it).
-    $st = q('UPDATE chain_txs SET deposit_id=? WHERE chain=? AND txid=? AND idx=? AND deposit_id IS NULL', [$target['id'], $chain, $t['txid'], $t['idx']]);
+    return reserve_and_credit($target, $chain, $t['txid'], (int)$t['idx'], $credit);
+}
+
+/** Atomically tie a transaction to a deposit and credit it. */
+function reserve_and_credit(array $dep, string $chain, string $txid, int $idx, float $credit): string
+{
+    $st = q('UPDATE chain_txs SET deposit_id=? WHERE chain=? AND txid=? AND idx=? AND deposit_id IS NULL', [$dep['id'], $chain, $txid, $idx]);
     if ($st->rowCount() !== 1) {
         return 'used';
     }
-    if (!credit_deposit((int)$target['id'], $t['txid'], $credit)) {
-        q('UPDATE chain_txs SET deposit_id=NULL WHERE chain=? AND txid=? AND idx=?', [$chain, $t['txid'], $t['idx']]);
+    if (!credit_deposit((int)$dep['id'], $txid, $credit)) {
+        q('UPDATE chain_txs SET deposit_id=NULL WHERE chain=? AND txid=? AND idx=?', [$chain, $txid, $idx]);
         return 'duplicate';
     }
+    q('UPDATE deposits SET review=0 WHERE id=?', [$dep['id']]);
     return 'credited';
+}
+
+/** Put a suspicious TXID claim on hold and ask the admins to approve or reject it. */
+function request_claim_review(array $dep, array $t, float $credit, bool $late): void
+{
+    $st = q(
+        "UPDATE deposits SET review=1, claim_txid=?, review_idx=? WHERE id=? AND review=0 AND status IN ('pending','expired')",
+        [$t['txid'], $t['idx'], $dep['id']]
+    );
+    if ($st->rowCount() !== 1) {
+        return; // already waiting for review
+    }
+    $info = chain_info($dep['chain']);
+    $u = get_user((int)$dep['user_id']);
+    $who = $u && $u['username'] ? '@' . e($u['username']) : e($u['first_name'] ?? '');
+    $reasons = [];
+    if (abs($credit - (float)$dep['amount']) > 0.009) {
+        $reasons[] = 'amount differs from the deposit (asked ' . money($dep['amount']) . ', received ≈ ' . money($credit) . ')';
+    }
+    if ($late) {
+        $reasons[] = 'sent after the deposit expired';
+    }
+    notify_admins_kb(
+        "🕵️ <b>TXID claim needs your approval</b>\n\n"
+        . "🧾 Deposit #{$dep['id']} by {$who} (<code>{$dep['user_id']}</code>)\n"
+        . '💵 Asked: <b>' . money($dep['amount']) . "</b>\n"
+        . '📥 Received: <b>' . e($t['amount']) . ' ' . $info['coin'] . '</b> ≈ <b>' . money($credit) . "</b>\n"
+        . '🕐 Deposit created: ' . e($dep['created_at']) . "\n"
+        . '🕐 Payment sent: ' . date('Y-m-d H:i:s', $t['time']) . "\n"
+        . '⚠️ Why: ' . e(implode('; ', $reasons)) . "\n\n"
+        . "🔗 <a href=\"" . e($info['explorer'] . $t['txid']) . "\">Check the transaction</a>\n\n"
+        . '<i>Approve only if you are sure this customer sent it (e.g. they showed you a screenshot from their wallet/exchange).</i>',
+        kb([[btn('✅ Approve ' . money($credit), 'a:dpa:' . $dep['id']), btn('❌ Reject', 'a:dpr:' . $dep['id'])]])
+    );
+}
+
+/** Admin approved a claim under review. */
+function approve_claim(int $depId): string
+{
+    $dep = q("SELECT * FROM deposits WHERE id=? AND review=1 AND status IN ('pending','expired')", [$depId])->fetch();
+    if (!$dep) {
+        return 'gone';
+    }
+    $tx = q('SELECT * FROM chain_txs WHERE chain=? AND txid=? AND idx=?', [$dep['chain'], $dep['claim_txid'], (int)$dep['review_idx']])->fetch();
+    if (!$tx) {
+        return 'gone';
+    }
+    return reserve_and_credit($dep, $dep['chain'], $tx['txid'], (int)$tx['idx'], deposit_value_usd($dep, (string)$tx['amount']));
+}
+
+function reject_claim(int $depId): bool
+{
+    $dep = q('SELECT * FROM deposits WHERE id=? AND review=1', [$depId])->fetch();
+    if (!$dep) {
+        return false;
+    }
+    q('UPDATE deposits SET review=0, claim_txid=NULL, review_idx=NULL WHERE id=?', [$depId]);
+    send($dep['user_id'], "❌ Your TXID for deposit #{$depId} was not approved. If you think this is a mistake, please contact support with proof of payment.", kb([[btn('🆘 Support', 'sup')]]));
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -731,7 +827,7 @@ function run_deposit_checks(): array
 
     // Re-check TXIDs that users submitted but were not final yet.
     $claims = q(
-        "SELECT * FROM deposits WHERE claim_txid IS NOT NULL AND status IN ('pending','expired') AND created_at > NOW() - INTERVAL 1 DAY"
+        "SELECT * FROM deposits WHERE claim_txid IS NOT NULL AND review=0 AND status IN ('pending','expired') AND created_at > NOW() - INTERVAL 1 DAY"
     )->fetchAll();
     foreach ($claims as $d) {
         $r = verify_txid($d, $d['claim_txid']);
@@ -769,9 +865,10 @@ function txid_status_text(string $status): string
 {
     return [
         'credited' => 'credited',
+        'review' => 'sent to the admin for a quick manual check',
         'unconfirmed' => 'waiting for confirmations',
         'not_found' => 'no payment to our address found in this transaction yet',
-        'used' => 'this transaction was already used for another deposit',
+        'used' => 'this transaction is already used by another deposit',
         'too_old' => 'this transaction was sent before the deposit was created',
         'duplicate' => 'this deposit was already credited',
     ][$status] ?? $status;

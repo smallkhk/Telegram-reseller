@@ -98,3 +98,10 @@ function notify_admins(string $text): void
         send($id, $text);
     }
 }
+
+function notify_admins_kb(string $text, array $kb): void
+{
+    foreach ((array)cfg('admin_ids', []) as $id) {
+        send($id, $text, $kb);
+    }
+}

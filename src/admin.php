@@ -20,10 +20,13 @@ function admin_home_view(): array
         . '💰 Wallet balances: <b>' . money($balances) . "</b>\n"
         . '💳 Deposits: <b>' . money($dep['total']) . '</b> (today ' . money($dep['today']) . ")\n"
         . "🛒 Sales: <b>{$ord['n']}</b> orders • <b>" . money($ord['total']) . '</b> (today ' . money($ord['today']) . ")\n"
-        . "🔑 Keys in stock: <b>{$stock}</b>";
+        . "🔑 Keys in stock: <b>{$stock}</b>\n"
+        . '⭐ Resellers: <b>' . (int)q('SELECT COUNT(*) FROM users WHERE is_reseller=1')->fetchColumn() . '</b>'
+        . (($rev = (int)q("SELECT COUNT(*) FROM deposits WHERE review=1 AND status IN ('pending','expired')")->fetchColumn()) ? "\n🕵️ TXID claims waiting for you: <b>{$rev}</b>" : '');
 
     return [$text, kb([
         [btn('🗂 Catalog', 'a:cats'), btn('👤 Find User', 'a:uf')],
+        [btn('⭐ Resellers', 'a:rs'), btn('🕵️ TXID Reviews', 'a:rv')],
         [btn('💳 Deposits', 'a:deps'), btn('🧾 Orders', 'a:ords')],
         [btn('📢 Broadcast', 'a:bc'), btn('🔄 Refresh', 'a:home')],
         [btn('🏠 Dashboard', 'home')],
@@ -55,7 +58,7 @@ function admin_cat_view(int $cid): array
     )->fetchAll();
     $rows = [];
     foreach ($prods as $p) {
-        $rows[] = [btn(($p['active'] ? '' : '🙈 ') . $p['name'] . ' • ' . money($p['price']) . ' • ' . $p['stock'] . ' keys', 'a:p:' . $p['id'])];
+        $rows[] = [btn(($p['active'] ? '' : '🙈 ') . $p['name'] . ' • ' . money($p['price']) . ($p['reseller_price'] !== null ? ' / ⭐' . money($p['reseller_price']) : '') . ' • ' . $p['stock'] . ' keys', 'a:p:' . $p['id'])];
     }
     $rows[] = [btn('➕ Add Product', 'a:pa:' . $cid)];
     $rows[] = [btn('✏️ Rename', 'a:cr:' . $cid), btn($c['active'] ? '🙈 Hide' : '👁 Show', 'a:ct:' . $cid), btn('🗑 Delete', 'a:cd:' . $cid)];
@@ -74,12 +77,14 @@ function admin_product_view(int $pid): array
     $sold = (int)q("SELECT COUNT(*) FROM product_keys WHERE product_id=? AND status='sold'", [$pid])->fetchColumn();
     $text = '📦 <b>' . e($p['name']) . "</b>\n"
         . '📁 ' . e($p['cat']) . "\n"
-        . '💵 Price: <b>' . money($p['price']) . "</b>\n"
+        . '💵 Customer price: <b>' . money($p['price']) . "</b>\n"
+        . '⭐ Reseller price: <b>' . ($p['reseller_price'] !== null ? money($p['reseller_price']) : 'same as customer') . "</b>\n"
         . "🔑 Available: <b>{$avail}</b> • Sold: <b>{$sold}</b>\n"
         . '👁 Status: <b>' . ($p['active'] ? 'Visible' : 'Hidden') . "</b>\n\n"
         . '📝 ' . ($p['description'] ? e($p['description']) : '<i>No description</i>');
     return [$text, kb([
-        [btn('➕ Add Keys', 'a:pk:' . $pid), btn('💲 Set Price', 'a:pp:' . $pid)],
+        [btn('➕ Add Keys', 'a:pk:' . $pid)],
+        [btn('💲 Customer Price', 'a:pp:' . $pid), btn('⭐ Reseller Price', 'a:pr:' . $pid)],
         [btn('✏️ Rename', 'a:pn:' . $pid), btn('📝 Description', 'a:pd:' . $pid)],
         [btn($p['active'] ? '🙈 Hide' : '👁 Show', 'a:pt:' . $pid), btn('🧹 Clear Unsold Keys', 'a:px:' . $pid)],
         [btn('🗑 Delete Product', 'a:pdel:' . $pid)],
@@ -102,9 +107,11 @@ function admin_user_view(int $uid): array
         . '💳 Deposited: <b>' . money($d) . "</b>\n"
         . "🛒 Orders: <b>{$o['n']}</b> (" . money($o['s']) . ")\n"
         . '📅 Joined: ' . e($u['created_at']) . "\n"
+        . '👤 Type: <b>' . ($u['is_reseller'] ? '⭐ Reseller' : 'Customer') . "</b>\n"
         . '🚦 Status: <b>' . ($u['is_banned'] ? 'Banned' : 'Active') . '</b>';
     return [$text, kb([
         [btn('➕ Add Balance', 'a:ub:' . $uid), btn('➖ Deduct Balance', 'a:ud:' . $uid)],
+        [btn($u['is_reseller'] ? '👤 Make Normal Customer' : '⭐ Make Reseller', 'a:ures:' . $uid)],
         [btn($u['is_banned'] ? '✅ Unban' : '🚫 Ban', 'a:uban:' . $uid)],
         [btn('⬅️ Admin', 'a:home')],
     ])];
@@ -166,6 +173,42 @@ function admin_callback(array $user, int $chatId, ?int $msgId, array $p): void
                 $cancel('a:p:' . $id),
             ];
             break;
+        case 'pr':
+            set_state($uid, 'a_rprice', $id);
+            [$t, $k] = ["⭐ Send the <b>reseller price</b> (e.g. <code>7.50</code>).\n\nSend <code>-</code> to remove it (resellers then pay the normal price).", $cancel('a:p:' . $id)];
+            break;
+        case 'ures':
+            $target = get_user($id);
+            if (!$target) {
+                toast('User not found.', true);
+                return;
+            }
+            $new = $target['is_reseller'] ? 0 : 1;
+            q('UPDATE users SET is_reseller=? WHERE id=?', [$new, $id]);
+            send($id, $new
+                ? "⭐ <b>Congratulations! You are now a reseller.</b>\n\nYou now see special reseller prices in the shop."
+                : 'ℹ️ Your account was changed back to a normal customer account.', kb([[btn('🛒 Shop', 'shop')]]));
+            toast($new ? 'User is now a reseller ⭐' : 'User is now a normal customer');
+            [$t, $k] = admin_user_view($id);
+            break;
+        case 'rs':
+            [$t, $k] = admin_resellers_view();
+            break;
+        case 'rv':
+            [$t, $k] = admin_reviews_view();
+            break;
+        case 'dpa':
+        case 'dpr':
+            if ($action === 'dpa') {
+                $r = approve_claim($id);
+                $msg = ['credited' => "✅ Deposit #{$id} approved and credited.", 'used' => "⚠️ Deposit #{$id}: that transaction was already used.", 'duplicate' => "⚠️ Deposit #{$id} was already credited."][$r] ?? "⚠️ Deposit #{$id} is no longer waiting for review.";
+            } else {
+                $msg = reject_claim($id) ? "❌ Deposit #{$id} claim rejected. The customer was told." : "⚠️ Deposit #{$id} is no longer waiting for review.";
+            }
+            toast(strip_tags($msg), true);
+            // Replace the buttons on the review message with the result.
+            edit($chatId, $msgId, $msg, kb([[btn('⚙️ Admin Panel', 'a:home')]]));
+            return;
         case 'pp':
             set_state($uid, 'a_price', $id);
             [$t, $k] = ['💲 Send the new <b>price</b> (e.g. <code>9.99</code>):', $cancel('a:p:' . $id)];
@@ -245,6 +288,39 @@ function admin_callback(array $user, int $chatId, ?int $msgId, array $p): void
             return;
     }
     edit($chatId, $msgId, $t, $k);
+}
+
+function admin_resellers_view(): array
+{
+    $rows = q('SELECT * FROM users WHERE is_reseller=1 ORDER BY created_at DESC LIMIT 50')->fetchAll();
+    $kb = [];
+    foreach ($rows as $u) {
+        $kb[] = [btn('⭐ ' . ($u['username'] ? '@' . $u['username'] : $u['first_name']) . ' • ' . money($u['balance']), 'a:u:' . $u['id'])];
+    }
+    $kb[] = [btn('👤 Find User to promote', 'a:uf')];
+    $kb[] = [btn('⬅️ Admin', 'a:home')];
+    $text = "⭐ <b>Resellers</b>\n\n" . ($rows
+        ? 'Tap a reseller to manage them.'
+        : "No resellers yet.\n\nTo make someone a reseller: tap <b>Find User</b>, send their @username or ID, then tap <b>⭐ Make Reseller</b>. (They must have started the bot first.)");
+    return [$text, kb($kb)];
+}
+
+function admin_reviews_view(): array
+{
+    $rows = q("SELECT d.*, t.amount AS rx FROM deposits d LEFT JOIN chain_txs t ON t.chain=d.chain AND t.txid=d.claim_txid AND t.idx=d.review_idx WHERE d.review=1 AND d.status IN ('pending','expired') ORDER BY d.id DESC LIMIT 20")->fetchAll();
+    if (!$rows) {
+        return ["🕵️ <b>TXID Reviews</b>\n\nNothing waiting for approval. 👍", kb([[btn('⬅️ Admin', 'a:home')]])];
+    }
+    $text = "🕵️ <b>TXID claims waiting for approval</b>\n";
+    $kb = [];
+    foreach ($rows as $d) {
+        $info = chain_info($d['chain']);
+        $text .= "\n#{$d['id']} • user <code>{$d['user_id']}</code> • asked " . money($d['amount']) . ' • received ' . e(norm_dec((string)$d['rx'])) . ' ' . $info['coin']
+            . ' • <a href="' . e($info['explorer'] . $d['claim_txid']) . '">tx</a>';
+        $kb[] = [btn("✅ Approve #{$d['id']}", 'a:dpa:' . $d['id']), btn("❌ Reject #{$d['id']}", 'a:dpr:' . $d['id'])];
+    }
+    $kb[] = [btn('⬅️ Admin', 'a:home')];
+    return [$text, kb($kb)];
 }
 
 function admin_deposits_view(): array
@@ -368,6 +444,22 @@ function admin_handle_state(array $user, array $m): void
             set_state($uid, null);
             [$t, $k] = admin_product_view($sid);
             send($chatId, "✅ Price updated.\n\n" . $t, $k);
+            return;
+
+        case 'a_rprice':
+            if ($text === '-') {
+                q('UPDATE products SET reseller_price=NULL WHERE id=?', [$sid]);
+            } else {
+                $price = parse_amount($text);
+                if ($price === null) {
+                    send($chatId, '⚠️ Send a valid price, e.g. <code>7.50</code>, or <code>-</code> to remove.');
+                    return;
+                }
+                q('UPDATE products SET reseller_price=? WHERE id=?', [dec($price), $sid]);
+            }
+            set_state($uid, null);
+            [$t, $k] = admin_product_view($sid);
+            send($chatId, "✅ Reseller price updated.\n\n" . $t, $k);
             return;
 
         case 'a_pname':
